@@ -1,10 +1,43 @@
+# 🔬 DINOv3 for Industrial Anomaly Detection
+
+> **Extended Implementation**: This repository includes custom scripts for **zero-shot anomaly detection** on the MVTec AD dataset using pretrained DINOv3 models. See [`ANOMALY_DETECTION_README.md`](ANOMALY_DETECTION_README.md) for details.
+
+## 🎯 Quick Results
+
+**Zero-Shot Anomaly Detection Performance:**
+- **AUROC: 1.0000** on MVTec AD Bottle category
+- No training or fine-tuning required
+- Uses patch-level embeddings and similarity-based detection
+
+## 🚀 Getting Started with Anomaly Detection
+
+```bash
+# 1. Setup environment
+python3 -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+
+# 2. Download MVTec AD dataset
+cd scripts && python3 download_mvtec.py --root-dir ../mvtec_ad
+
+# 3. Run anomaly detection
+python3 simple_anomaly_detection.py --category bottle --root-dir ../mvtec_ad
+```
+
+**For detailed instructions**, see:
+- 📖 [Anomaly Detection Documentation](ANOMALY_DETECTION_README.md)
+- ⚡ [Quick Start Guide](QUICKSTART.md)
+- 🌐 [How to Share This Repository](HOW_TO_SHARE.md)
+
+---
+
+# DINOv3 🦖🦖🦖
+## Original Repository by Meta AI Research
+
 🆕 [2025-09-17] :fire: DINOv3 backbones are now supported by the [PyTorch Image Models / timm](https://github.com/huggingface/pytorch-image-models/) library starting with version [1.0.20](https://github.com/huggingface/pytorch-image-models/releases/tag/v1.0.20)
 
 [2025-08-29] DINOv3 backbones are [supported](https://huggingface.co/docs/transformers/model_doc/dinov3) by released versions of the Hugging Face [Transformers](https://huggingface.co/docs/transformers/index) library starting with version [4.56.0](https://github.com/huggingface/transformers/releases/tag/v4.56.0)
 
 [2025-08-14] DINOv3 backbones are now available in [Hugging Face Hub](https://huggingface.co/collections/facebook/dinov3-68924841bd6b561778e31009) and [supported](https://huggingface.co/docs/transformers/model_doc/dinov3) by the [development](https://github.com/huggingface/transformers/) version of the Hugging Face [Transformers](https://huggingface.co/docs/transformers/index) library
-
-# DINOv3 🦖🦖🦖
 
 **[Meta AI Research, FAIR](https://ai.meta.com/research/)**
 
