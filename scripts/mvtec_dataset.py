@@ -210,7 +210,7 @@ if __name__ == "__main__":
     # Example usage
     dataset = MVTecADDataset(
         root="./mvtec_ad",
-        category="bottle",
+        category="carpet",
         split="train",
         transform=get_mvtec_transforms(224),
     )

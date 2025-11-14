@@ -1,19 +1,23 @@
 """
-Simple anomaly detection using torch.hub (no transformers required).
+Few-shot anomaly detection using DINOv3.
 
-This version uses torch.hub to load DINOv3 models, avoiding the
-transformers library which has threading issues on some macOS systems.
+This script performs anomaly detection using only a few normal samples
+for training, making it suitable for scenarios with limited normal data.
 """
 
 import argparse
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 import numpy as np
 from pathlib import Path
 import json
 from tqdm import tqdm
 from sklearn.metrics import roc_auc_score, average_precision_score
+import random
 
+# Import from parent directory
+import sys
+sys.path.append('..')
 from mvtec_dataset import MVTecADDataset, get_mvtec_transforms
 
 
@@ -160,21 +164,43 @@ def evaluate(anomaly_scores, labels):
     }
 
 
+def create_few_shot_dataset(dataset, n_shots, seed=42):
+    """Create a few-shot dataset by sampling n_shots normal samples."""
+    random.seed(seed)
+    np.random.seed(seed)
+    
+    # Get indices of normal samples
+    normal_indices = dataset.get_normal_samples()
+    
+    if len(normal_indices) < n_shots:
+        print(f"Warning: Only {len(normal_indices)} normal samples available, using all of them.")
+        selected_indices = normal_indices
+    else:
+        # Randomly sample n_shots normal samples
+        selected_indices = random.sample(normal_indices, n_shots)
+    
+    print(f"Selected {len(selected_indices)} normal samples for few-shot training")
+    return Subset(dataset, selected_indices)
+
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Simple anomaly detection with DINOv3")
-    parser.add_argument("--category", type=str, default="cable")
+    parser = argparse.ArgumentParser(description="Few-shot anomaly detection with DINOv3")
+    parser.add_argument("--category", type=str, default="bottle")
     parser.add_argument("--root-dir", type=str, default="mvtec_ad")
     parser.add_argument("--model-name", type=str, default="dinov3_vits16",
                        choices=['dinov3_vits16', 'dinov3_vitb16', 'dinov3_vitl16'])
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--use-cls", action="store_true")
     parser.add_argument("--k-neighbors", type=int, default=1)
+    parser.add_argument("--n-shots", type=int, default=5, help="Number of normal samples for training")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--output-dir", type=str, default="../results")
 
     args = parser.parse_args()
 
     print("\n" + "=" * 70)
-    print(f"Anomaly Detection: {args.category}")
+    print(f"Few-Shot Anomaly Detection: {args.category} ({args.n_shots} shots)")
     print("=" * 70 + "\n")
 
     # Setup device
@@ -189,15 +215,18 @@ def main():
     transform = get_mvtec_transforms(224)
 
     print("\nLoading training data...")
-    train_dataset = MVTecADDataset(
+    full_train_dataset = MVTecADDataset(
         root=args.root_dir,
         category=args.category,
         split='train',
         transform=transform,
     )
-
+    
+    # Create few-shot dataset
+    train_dataset = create_few_shot_dataset(full_train_dataset, args.n_shots, args.seed)
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=custom_collate_fn)
-    print(f"  Train samples: {len(train_dataset)}")
+    print(f"  Total train samples available: {len(full_train_dataset)}")
+    print(f"  Few-shot train samples used: {len(train_dataset)}")
 
     print("\nLoading test data...")
     test_dataset = MVTecADDataset(
@@ -237,23 +266,31 @@ def main():
     metrics = evaluate(anomaly_scores, test_embeddings['labels'])
 
     print("\n" + "=" * 70)
-    print(f"Results for {args.category}:")
+    print(f"Few-Shot Results for {args.category} ({args.n_shots} shots):")
     print("=" * 70)
+    print(f"  Training samples used: {len(train_dataset)}")
     print(f"  AUROC: {metrics['auroc']:.4f}")
     print(f"  Average Precision: {metrics['average_precision']:.4f}")
     print("=" * 70 + "\n")
 
-    # Save results
-    output_dir = Path(args.output_dir) / args.category
+    # Save results with few-shot information
+    output_dir = Path(args.output_dir) / f"{args.category}_fewshot_{args.n_shots}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Add few-shot metadata to metrics
+    metrics['n_shots'] = args.n_shots
+    metrics['seed'] = args.seed
+    metrics['total_train_samples'] = len(full_train_dataset)
+    metrics['used_train_samples'] = len(train_dataset)
+    
     metrics_file = output_dir / "metrics.json"
     with open(metrics_file, 'w') as f:
         json.dump(metrics, f, indent=2)
     print(f"Saved metrics to {metrics_file}")
 
     scores_file = output_dir / "anomaly_scores.npz"
-    np.savez(scores_file, scores=anomaly_scores, labels=test_embeddings['labels'])
+    np.savez(scores_file, scores=anomaly_scores, labels=test_embeddings['labels'], 
+             n_shots=args.n_shots, seed=args.seed)
     print(f"Saved anomaly scores to {scores_file}")
 
 
