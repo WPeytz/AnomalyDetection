@@ -4,6 +4,12 @@ Zero-shot and Few-shot Anomaly Detection using DINOv3
 This script implements anomaly detection on MVTec AD dataset using
 pretrained DINOv3 embeddings.
 """
+# Load model directly
+from transformers import AutoImageProcessor, AutoModel
+
+processor = AutoImageProcessor.from_pretrained("facebook/dinov3-vits16-pretrain-lvd1689m")
+model = AutoModel.from_pretrained("facebook/dinov3-vits16-pretrain-lvd1689m")
+
 
 import argparse
 import torch
@@ -19,6 +25,24 @@ from embedding_extractor import (
     DINOv3EmbeddingExtractor,
     compute_anomaly_scores,
 )
+
+
+def custom_collate_fn(batch):
+    """Custom collate function to handle None values in masks."""
+    # Separate items by key
+    images = torch.stack([item['image'] for item in batch])
+    labels = torch.tensor([item['label'] for item in batch])
+    masks = [item['mask'] for item in batch]  # Keep as list, may contain None
+    defect_types = [item['defect_type'] for item in batch]
+    image_paths = [item['image_path'] for item in batch]
+
+    return {
+        'image': images,
+        'label': labels,
+        'mask': masks,
+        'defect_type': defect_types,
+        'image_path': image_paths,
+    }
 
 
 def evaluate_anomaly_detection(
@@ -143,7 +167,7 @@ def run_anomaly_detection(
         split='train',
         transform=transform,
     )
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, collate_fn=custom_collate_fn)
 
     # Extract training embeddings
     print(f"Training samples: {len(train_dataset)}")
@@ -169,7 +193,7 @@ def run_anomaly_detection(
         split='test',
         transform=transform,
     )
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=custom_collate_fn)
 
     # Extract test embeddings
     print(f"Test samples: {len(test_dataset)}")

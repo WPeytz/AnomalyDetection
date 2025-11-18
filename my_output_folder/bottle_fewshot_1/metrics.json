@@ -1,0 +1,8 @@
+{
+  "auroc": 0.9753968253968255,
+  "average_precision": 0.9926496474962494,
+  "n_shots": 1,
+  "seed": 42,
+  "total_train_samples": 209,
+  "used_train_samples": 1
+}
