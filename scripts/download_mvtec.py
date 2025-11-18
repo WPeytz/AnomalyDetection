@@ -42,6 +42,7 @@ def download_mvtec_ad(root_dir="./mvtec_ad"):
         'hazelnut', 'leather', 'metal_nut', 'pill', 'screw',
         'tile', 'toothbrush', 'transistor', 'wood', 'zipper'
     ]
+    # categories = ['bottle']
 
     base_url = "https://www.mydrive.ch/shares/38536/3830184030e49fe74747669442f0f282/download/"
 
