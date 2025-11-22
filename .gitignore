@@ -1,0 +1,91 @@
+build/
+dist/
+*.egg-info/
+**/__pycache__/
+
+**/.ipynb_checkpoints
+**/.ipynb_checkpoints/**
+
+**/notebooks
+
+# Ignore shell scripts
+*.sh
+
+# Ignore swap files
+*.swp
+
+# Ignore vscode directory
+.vscode/
+# Custom .gitignore for Anomaly Detection Project
+
+# Dataset (too large for GitHub)
+mvtec_ad/
+*.tar.xz
+Project/
+
+scripts/SAM/
+scripts/All_models_combined/results/
+scripts/Backup_all_models/
+scripts/Few_shot_anaomaly_detection/
+
+
+# Model weights (too large, users should download themselves)
+*.pth
+*.pt
+*.ckpt
+
+# Results and outputs
+results/
+outputs/
+*.npz
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# Cache
+.cache/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+/tmp/
+*.tmp
