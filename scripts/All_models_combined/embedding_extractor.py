@@ -134,8 +134,9 @@ class DINOv3EmbeddingExtractor:
         result = {'patch_embeddings': patch_embeddings}
         if return_cls_token:
             result['cls_token'] = cls_token
-
+        
         return result
+    
 
     @torch.no_grad()
     def extract_embeddings_batch(
@@ -201,66 +202,136 @@ def compute_similarity_scores(
     query_embeddings: np.ndarray,
     reference_embeddings: np.ndarray,
     metric: str = 'cosine',
+    k: int = 3,
 ) -> np.ndarray:
     """
     Compute similarity scores between query and reference embeddings.
+    GPU-accelerated version using PyTorch.
 
     Args:
         query_embeddings: Query embeddings (N, D) or (N, P, D)
         reference_embeddings: Reference embeddings (M, D) or (M, P, D)
-        metric: Similarity metric ('cosine' or 'euclidean')
+        metric: Similarity metric ('cosine', 'euclidean', or 'knn')
+        k: Number of nearest neighbors for knn metric
 
     Returns:
         Similarity scores (N, M) or (N, P, M, P) for patch embeddings
     """
+    # Convert to torch tensors and move to GPU if available
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    query_torch = torch.from_numpy(query_embeddings).float().to(device)
+    reference_torch = torch.from_numpy(reference_embeddings).float().to(device)
+    
     if metric == 'cosine':
         # Normalize embeddings
-        query_norm = query_embeddings / (np.linalg.norm(query_embeddings, axis=-1, keepdims=True) + 1e-8)
-        reference_norm = reference_embeddings / (np.linalg.norm(reference_embeddings, axis=-1, keepdims=True) + 1e-8)
+        query_norm = query_torch / (torch.norm(query_torch, dim=-1, keepdim=True) + 1e-8)
+        reference_norm = reference_torch / (torch.norm(reference_torch, dim=-1, keepdim=True) + 1e-8)
 
         if query_embeddings.ndim == 2:
-            # CLS token embeddings
+            # CLS token embeddings: (N, D) @ (D, M) = (N, M)
             similarities = query_norm @ reference_norm.T
         else:
-            # Patch embeddings: (N, P, D) @ (M, P, D)
-            # Compute max similarity across patches
-            N, P, D = query_embeddings.shape
-            M = reference_embeddings.shape[0]
-
-            similarities = np.zeros((N, M))
-            for i in range(N):
-                for j in range(M):
-                    # Compute pairwise cosine similarity between patches
-                    patch_sim = query_norm[i] @ reference_norm[j].T  # (P, P)
-                    # Take max similarity for each query patch
-                    similarities[i, j] = patch_sim.max(axis=1).mean()
+            # Patch embeddings: (N, P, D) and (M, P, D)
+            N, P_q, D = query_torch.shape
+            M, P_r, D_r = reference_torch.shape
+            
+            if P_q != P_r:
+                raise ValueError(f"Query and reference must have same number of patches. Got {P_q} and {P_r}")
+            
+            P = P_q  # Number of patches
+            
+            # Compute all pairwise patch similarities using einsum for efficiency
+            # query_norm: (N, P, D), reference_norm: (M, P, D)
+            # Result shape: (N, P, M, P) where first P is query patch, second P is reference patch
+            all_sims = torch.einsum('nid,mjd->nimj', query_norm, reference_norm)
+            
+            # For each query image and reference image pair:
+            # Take max similarity over reference patches (dim 3), then mean over query patches (dim 1)
+            similarities = all_sims.max(dim=3)[0].mean(dim=1)  # (N, M)
 
     elif metric == 'euclidean':
         if query_embeddings.ndim == 2:
-            # CLS token embeddings
-            similarities = -np.linalg.norm(
-                query_embeddings[:, None, :] - reference_embeddings[None, :, :],
-                axis=-1
-            )
+            # CLS token embeddings: use cdist for efficiency
+            similarities = -torch.cdist(query_torch, reference_torch, p=2)
         else:
             # Patch embeddings
-            N, P, D = query_embeddings.shape
-            M = reference_embeddings.shape[0]
-
-            similarities = np.zeros((N, M))
-            for i in range(N):
-                for j in range(M):
-                    # Compute pairwise euclidean distance between patches
-                    dists = np.linalg.norm(
-                        query_embeddings[i, :, None, :] - reference_embeddings[j, None, :, :],
-                        axis=-1
-                    )  # (P, P)
-                    # Take min distance for each query patch (negative for similarity)
-                    similarities[i, j] = -dists.min(axis=1).mean()
+            N, P_q, D = query_torch.shape
+            M, P_r, D_r = reference_torch.shape
+            
+            if P_q != P_r:
+                raise ValueError(f"Query and reference must have same number of patches. Got {P_q} and {P_r}")
+            
+            P = P_q
+            
+            # Compute pairwise distances efficiently
+            # Reshape to compute all pairwise patch distances
+            # query: (N, P, D) -> (N*P, D)
+            # reference: (M, P, D) -> (M*P, D)
+            query_flat = query_torch.reshape(N * P, D)
+            reference_flat = reference_torch.reshape(M * P, D)
+            
+            # Compute all pairwise distances: (N*P, M*P)
+            all_dists = torch.cdist(query_flat, reference_flat, p=2)
+            
+            # Reshape back: (N, P, M, P)
+            all_dists = all_dists.reshape(N, P, M, P)
+            
+            # Min distance over reference patches (dim 3), then mean over query patches (dim 1)
+            similarities = -all_dists.min(dim=3)[0].mean(dim=1)  # (N, M)
+    
+    elif metric == 'knn':
+        # k-NN distance metric (GPU-optimized)
+        if query_embeddings.ndim == 2:
+            # CLS token embeddings: (N, D) and (M, D)
+            # Compute all pairwise distances: (N, M)
+            distances = torch.cdist(query_torch, reference_torch, p=2)
+            
+            # For each query, get k nearest neighbors
+            if k >= distances.shape[1]:
+                # If k >= M, use all reference samples
+                similarities = -distances.mean(dim=1, keepdim=True).expand(-1, distances.shape[1])
+            else:
+                # Get top-k smallest distances (nearest neighbors)
+                topk_dists, _ = torch.topk(distances, k, dim=1, largest=False)
+                # Average distance to k nearest neighbors
+                avg_knn_dist = topk_dists.mean(dim=1, keepdim=True)
+                # Expand to maintain (N, M) shape for consistency
+                similarities = -avg_knn_dist.expand(-1, distances.shape[1])
+        else:
+            # Patch embeddings: (N, P, D) and (M, P, D)
+            N, P_q, D = query_torch.shape
+            M, P_r, D_r = reference_torch.shape
+            
+            if P_q != P_r:
+                raise ValueError(f"Query and reference must have same number of patches. Got {P_q} and {P_r}")
+            
+            P = P_q
+            
+            # Flatten patches for efficient distance computation
+            query_flat = query_torch.reshape(N * P, D)
+            reference_flat = reference_torch.reshape(M * P, D)
+            
+            # Compute all pairwise patch distances: (N*P, M*P)
+            all_dists = torch.cdist(query_flat, reference_flat, p=2)
+            
+            # Reshape to (N, P, M*P)
+            all_dists = all_dists.reshape(N, P, M * P)
+            
+            # For each query patch, find k nearest reference patches
+            k_patches = min(k, M * P)
+            topk_dists, _ = torch.topk(all_dists, k_patches, dim=2, largest=False)
+            
+            # Average over k nearest patches, then over query patches
+            avg_patch_knn = topk_dists.mean(dim=2).mean(dim=1)  # (N,)
+            
+            # Expand to (N, M) for consistency
+            similarities = -avg_patch_knn.unsqueeze(1).expand(-1, M)
+    
     else:
-        raise ValueError(f"Unknown metric: {metric}")
+        raise ValueError(f"Unknown metric: {metric}. Choose from 'cosine', 'euclidean', or 'knn'")
 
-    return similarities
+    # Convert back to numpy
+    return similarities.cpu().numpy()
 
 
 def compute_anomaly_scores(
@@ -275,27 +346,35 @@ def compute_anomaly_scores(
     Args:
         test_embeddings: Test embeddings (N, D) or (N, P, D)
         normal_embeddings: Normal embeddings (M, D) or (M, P, D)
-        metric: Similarity metric ('cosine' or 'euclidean')
+        metric: Similarity metric ('cosine', 'euclidean', or 'knn')
         k: Number of nearest neighbors to consider
 
     Returns:
         Anomaly scores (N,) - higher means more anomalous
     """
-    similarities = compute_similarity_scores(test_embeddings, normal_embeddings, metric)
-
-    # Get k nearest neighbors
-    if k == 1:
-        max_similarities = similarities.max(axis=1)
+    if metric == 'knn':
+        # For k-NN metric, pass k to compute_similarity_scores
+        similarities = compute_similarity_scores(test_embeddings, normal_embeddings, metric='knn', k=k)
+        # k-NN returns negative distances, convert to anomaly scores
+        # More negative (larger distance) = more anomalous
+        anomaly_scores = -similarities[:, 0]  # Take first column (all columns are same for knn)
     else:
-        # Take average of top-k similarities
-        top_k_indices = np.argsort(similarities, axis=1)[:, -k:]
-        max_similarities = np.mean(
-            np.take_along_axis(similarities, top_k_indices, axis=1),
-            axis=1
-        )
+        # For cosine and euclidean metrics
+        similarities = compute_similarity_scores(test_embeddings, normal_embeddings, metric=metric)
 
-    # Convert similarity to anomaly score (lower similarity = higher anomaly)
-    anomaly_scores = 1 - max_similarities
+        # Get k nearest neighbors
+        if k == 1:
+            max_similarities = similarities.max(axis=1)
+        else:
+            # Take average of top-k similarities
+            top_k_indices = np.argsort(similarities, axis=1)[:, -k:]
+            max_similarities = np.mean(
+                np.take_along_axis(similarities, top_k_indices, axis=1),
+                axis=1
+            )
+
+        # Convert similarity to anomaly score (lower similarity = higher anomaly)
+        anomaly_scores = 1 - max_similarities
 
     return anomaly_scores
 

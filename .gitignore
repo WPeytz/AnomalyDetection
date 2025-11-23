@@ -21,6 +21,13 @@ dist/
 # Dataset (too large for GitHub)
 mvtec_ad/
 *.tar.xz
+Project/
+
+scripts/SAM/
+scripts/All_models_combined/results/
+scripts/Backup_all_models/
+scripts/Few_shot_anaomaly_detection/
+
 
 # Model weights (too large, users should download themselves)
 *.pth
