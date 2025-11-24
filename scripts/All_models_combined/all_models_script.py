@@ -26,6 +26,7 @@ import warnings
 # Import local modules
 from embedding_extractor import DINOv3EmbeddingExtractor, compute_anomaly_scores
 from mvtec_dataset import MVTecADDataset, get_mvtec_transforms
+import seaborn as sns
 
 # Check SAM availability
 try:
@@ -69,8 +70,13 @@ def compute_patch_anomaly_scores_zeroshot(
     
     N, P, D = test_embeddings.shape
     
-    # Convert to torch tensors and move to GPU
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    # Convert to torch tensors and conditional for NVIDIA GPU, Apple Silicon or cpu
+    if torch.backends.mps.is_available():
+        device = 'mps'  # Apple Silicon GPU
+    elif torch.cuda.is_available():
+        device = 'cuda'
+    else:
+        device = 'cpu'
     test_torch = torch.from_numpy(test_embeddings).float().to(device)
     
     all_patch_scores = []
@@ -169,8 +175,13 @@ def compute_patch_anomaly_scores(
     N, P, D = test_embeddings.shape
     M = normal_embeddings.shape[0]
     
-    # Convert to torch tensors and move to GPU
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    # Convert to torch tensors and conditional for NVIDIA GPU, Apple Silicon or cpu
+    if torch.backends.mps.is_available():
+        device = 'mps'  # Apple Silicon GPU
+    elif torch.cuda.is_available():
+        device = 'cuda'
+    else:
+        device = 'cpu'
     test_torch = torch.from_numpy(test_embeddings).float().to(device)
     normal_torch = torch.from_numpy(normal_embeddings).float().to(device)
     
@@ -219,11 +230,18 @@ class SAMIntegrator:
         Args:
             sam_checkpoint: Path to SAM checkpoint file
             model_type: SAM model type ('vit_h', 'vit_l', 'vit_b')
-            device: Device to use ('cuda' or 'cpu')
+            device: Device to use ('cuda', 'mps', or 'cpu')
         """
         self.sam_available = SAM_AVAILABLE and sam_checkpoint is not None
         self.predictor = None
-        self.device = device if torch.cuda.is_available() else "cpu"
+        
+        # Optimize device selection for M2 MacBook
+        if device == "mps" and torch.backends.mps.is_available():
+            self.device = "mps"
+        elif device == "cuda" and torch.cuda.is_available():
+            self.device = "cuda"
+        else:
+            self.device = "cpu"
         
         if self.sam_available:
             try:
@@ -431,6 +449,197 @@ class SAMIntegrator:
         
         return masks
 
+class FlippedDataset(torch.utils.data.Dataset):
+    """Wrapper to return horizontally flipped images."""
+    def __init__(self, dataset):
+        self.dataset = dataset
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        # Handle subset or original dataset
+        if hasattr(self.dataset, 'dataset'):
+             # If it's a Subset
+             sample = self.dataset.dataset[self.dataset.indices[idx]]
+        else:
+             sample = self.dataset[idx]
+             
+        # Create a shallow copy to avoid modifying the original cache
+        sample = sample.copy()
+        # Flip image tensor (C, H, W) -> Flip on last dimension (W)
+        sample['image'] = torch.flip(sample['image'], dims=[-1])
+        return sample
+
+class MirroringAnomalyDetector:
+    """
+    Implements the Mirroring DINO strategy: comparing an image with its flipped version.
+    """
+    def __init__(self, extractor, image_size=224, patch_size=14):
+        self.extractor = extractor
+        self.image_size = image_size
+        self.patch_size = patch_size
+        # Grid size: For patch_size=14 on 224x224 image, we get 224/14=16 patches per side
+        # BUT the actual spatial grid is 14x14=196 patches (not 16x16=256)
+        # This is because DINOv3 uses overlapping patches or different stride
+        self.grid_h = 14  # Actual spatial grid size for DINOv3
+        self.grid_w = 14
+        self.baseline_mean = 0
+        self.baseline_std = 1
+
+    def _align_flipped_patches(self, flipped_embeddings):
+        """
+        Re-aligns embeddings from a flipped image to match the original spatial grid.
+        Input: (N, P, D)
+        """
+        N, P, D = flipped_embeddings.shape
+        expected_patches = self.grid_h * self.grid_w  # 14*14 = 196 for DINOv3
+        
+        # Detect and handle register tokens (usually 4 in DINOv3)
+        n_registers = 0
+        if P > expected_patches:
+            n_registers = P - expected_patches
+            
+        # Separate registers and spatial tokens
+        registers = flipped_embeddings[:, :n_registers, :]
+        spatial = flipped_embeddings[:, n_registers:, :]
+        
+        # Check if spatial patches match expected grid
+        current_P = spatial.shape[1]
+        
+        if current_P == expected_patches:
+            # Perfect match: 196 spatial patches for 14x14 grid
+            h, w = self.grid_h, self.grid_w
+            
+            try:
+                spatial_grid = spatial.reshape(N, h, w, D)
+                
+                # Flip back horizontally (axis 2 is Width)
+                spatial_grid_flipped = torch.flip(torch.tensor(spatial_grid), dims=[2]).numpy()
+                
+                # Flatten back
+                spatial_restored = spatial_grid_flipped.reshape(N, current_P, D)
+                
+                # Recombine with registers
+                if n_registers > 0:
+                    return np.concatenate([registers, spatial_restored], axis=1)
+                return spatial_restored
+                
+            except Exception as e:
+                print(f"Warning: Patch reshaping failed: {e}")
+                print(f"Using fallback: returning original embeddings")
+                return flipped_embeddings
+        else:
+            # Mismatch: try to auto-detect grid or use fallback
+            print(f"Warning: Spatial patch count mismatch.")
+            print(f"Expected: {expected_patches} ({self.grid_h}x{self.grid_w}), Got: {current_P}")
+            
+            # Try to detect if it's a perfect square
+            h = int(np.sqrt(current_P))
+            if h * h == current_P:
+                print(f"Auto-detected {h}x{h} grid for {current_P} patches")
+                try:
+                    spatial_grid = spatial.reshape(N, h, h, D)
+                    spatial_grid_flipped = torch.flip(torch.tensor(spatial_grid), dims=[2]).numpy()
+                    spatial_restored = spatial_grid_flipped.reshape(N, current_P, D)
+                    
+                    if n_registers > 0:
+                        return np.concatenate([registers, spatial_restored], axis=1)
+                    return spatial_restored
+                    
+                except Exception as e:
+                    print(f"Auto-detection failed: {e}")
+                    
+            print("Using fallback: returning original embeddings")
+            return flipped_embeddings
+
+    def fit(self, train_loader):
+        """
+        'Training' phase: Compute symmetry error on normal data to establish a baseline.
+        """
+        print("Training Mirroring Model (Estimating Normal Symmetry Error)...")
+        
+        # 1. Get Original Embeddings
+        orig_results = self.extractor.extract_embeddings_batch(
+            train_loader, extract_patches=True, extract_cls=False
+        )
+        orig_patches = orig_results['patch_embeddings']
+        
+        # 2. Get Flipped Embeddings
+        # Create a flipped version of the dataset/loader
+        train_dataset_flipped = FlippedDataset(train_loader.dataset)
+        flipped_loader = DataLoader(
+            train_dataset_flipped, 
+            batch_size=train_loader.batch_size, 
+            shuffle=False, 
+            collate_fn=train_loader.collate_fn
+        )
+        
+        flip_results = self.extractor.extract_embeddings_batch(
+            flipped_loader, extract_patches=True, extract_cls=False
+        )
+        flip_patches = flip_results['patch_embeddings']
+        
+        # 3. Align Flipped Patches Back
+        flip_patches_aligned = self._align_flipped_patches(flip_patches)
+        
+        # 4. Compute Patch-wise Cosine Distance
+        # Normalize
+        orig_norm = orig_patches / (np.linalg.norm(orig_patches, axis=-1, keepdims=True) + 1e-8)
+        flip_norm = flip_patches_aligned / (np.linalg.norm(flip_patches_aligned, axis=-1, keepdims=True) + 1e-8)
+        
+        # Cosine similarity per patch
+        sim_per_patch = (orig_norm * flip_norm).sum(axis=-1)
+        dist_per_patch = 1 - sim_per_patch
+        
+        # Image-level score: Max patch error (most asymmetric part)
+        image_scores = dist_per_patch.max(axis=1)
+        
+        self.baseline_mean = np.mean(image_scores)
+        self.baseline_std = np.std(image_scores)
+        
+        print(f"  Normal Baseline: Mean={self.baseline_mean:.4f}, Std={self.baseline_std:.4f}")
+
+    def predict(self, test_loader):
+        """
+        Evaluation phase: Compute symmetry error for test images.
+        """
+        print("Evaluating with Mirroring Strategy...")
+        
+        # 1. Original
+        orig_results = self.extractor.extract_embeddings_batch(
+            test_loader, extract_patches=True, extract_cls=False
+        )
+        orig_patches = orig_results['patch_embeddings']
+        
+        # 2. Flipped
+        test_dataset_flipped = FlippedDataset(test_loader.dataset)
+        flipped_loader = DataLoader(
+            test_dataset_flipped, 
+            batch_size=test_loader.batch_size, 
+            shuffle=False, 
+            collate_fn=test_loader.collate_fn
+        )
+        flip_results = self.extractor.extract_embeddings_batch(
+            flipped_loader, extract_patches=True, extract_cls=False
+        )
+        flip_patches = flip_results['patch_embeddings']
+        
+        # 3. Align
+        flip_patches_aligned = self._align_flipped_patches(flip_patches)
+        
+        # 4. Compute Scores
+        orig_norm = orig_patches / (np.linalg.norm(orig_patches, axis=-1, keepdims=True) + 1e-8)
+        flip_norm = flip_patches_aligned / (np.linalg.norm(flip_patches_aligned, axis=-1, keepdims=True) + 1e-8)
+        
+        sim_per_patch = (orig_norm * flip_norm).sum(axis=-1)
+        dist_per_patch = 1 - sim_per_patch
+        
+        # Image-level anomaly score
+        raw_scores = dist_per_patch.max(axis=1)
+        
+        return raw_scores, dist_per_patch, orig_results['labels']
+
 
 def create_anomaly_heatmap(patch_scores: np.ndarray, patch_size: int = 16, image_size: int = 224) -> np.ndarray:
     """
@@ -493,6 +702,7 @@ def custom_collate_fn(batch):
 def evaluate_anomaly_detection(
     anomaly_scores: np.ndarray,
     labels: np.ndarray,
+    threshold: Optional[float] = None
 ) -> dict:
     """
     Evaluate anomaly detection performance.
@@ -500,18 +710,144 @@ def evaluate_anomaly_detection(
     Args:
         anomaly_scores: Anomaly scores (N,)
         labels: Ground truth labels (N,) - 0 for normal, 1 for anomaly
+        threshold: Classification threshold (if None, uses optimal threshold from ROC)
 
     Returns:
-        Dictionary with evaluation metrics
+        Dictionary with evaluation metrics including confusion matrix values
     """
-    # Compute metrics
+    from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_score, roc_curve
+    
+    # Compute AUC metrics
     auroc = roc_auc_score(labels, anomaly_scores)
     ap = average_precision_score(labels, anomaly_scores)
+    
+    # Determine threshold if not provided
+    if threshold is None:
+        # Use Youden's index (optimal threshold from ROC curve)
+        fpr, tpr, thresholds = roc_curve(labels, anomaly_scores)
+        optimal_idx = np.argmax(tpr - fpr)
+        threshold = thresholds[optimal_idx]
+    
+    # Make binary predictions
+    predictions = (anomaly_scores >= threshold).astype(int)
+    
+    # Compute confusion matrix
+    cm = confusion_matrix(labels, predictions)
+    
+    # Extract TP, FP, TN, FN
+    if cm.shape == (2, 2):
+        tn, fp, fn, tp = cm.ravel()
+    else:
+        # Handle edge case where only one class is present
+        if len(np.unique(labels)) == 1:
+            if labels[0] == 0:  # Only normal samples
+                tn = len(labels) - np.sum(predictions)
+                fp = np.sum(predictions)
+                fn, tp = 0, 0
+            else:  # Only anomaly samples
+                tp = np.sum(predictions)
+                fn = len(labels) - np.sum(predictions)
+                tn, fp = 0, 0
+        else:
+            tn, fp, fn, tp = 0, 0, 0, 0
+    
+    # Compute additional metrics
+    precision = precision_score(labels, predictions, zero_division=0)
+    recall = recall_score(labels, predictions, zero_division=0)
+    f1 = f1_score(labels, predictions, zero_division=0)
+    
+    # Compute accuracy
+    accuracy = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else 0
+    
+    # Compute specificity (True Negative Rate)
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
 
     return {
         'auroc': float(auroc),
         'average_precision': float(ap),
+        'threshold': float(threshold),
+        'accuracy': float(accuracy),
+        'precision': float(precision),
+        'recall': float(recall),
+        'f1_score': float(f1),
+        'specificity': float(specificity),
+        'true_positives': int(tp),
+        'false_positives': int(fp),
+        'true_negatives': int(tn),
+        'false_negatives': int(fn),
+        'confusion_matrix': cm.tolist()
     }
+
+
+def plot_confusion_matrix(
+    confusion_matrix: np.ndarray,
+    save_path: Path,
+    class_names: List[str] = None,
+    title: str = "Confusion Matrix",
+    normalize: bool = False
+) -> None:
+    """
+    Create and save a confusion matrix visualization.
+    
+    Args:
+        confusion_matrix: 2x2 confusion matrix array
+        save_path: Path to save the plot
+        class_names: Names for the classes (default: ['Normal', 'Anomaly'])
+        title: Plot title
+        normalize: Whether to normalize the values
+    """
+    if class_names is None:
+        class_names = ['Normal', 'Anomaly']
+    
+    # Convert to numpy array if needed
+    if isinstance(confusion_matrix, list):
+        cm = np.array(confusion_matrix)
+    else:
+        cm = confusion_matrix
+    
+    # Normalize if requested
+    if normalize:
+        cm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+        fmt = '.2f'
+        title += ' (Normalized)'
+    else:
+        fmt = 'd'
+    
+    # Create figure
+    plt.figure(figsize=(8, 6))
+    
+    # Create heatmap
+    sns.heatmap(cm, 
+                annot=True, 
+                fmt=fmt, 
+                cmap='Blues',
+                square=True,
+                cbar_kws={'label': 'Count' if not normalize else 'Proportion'},
+                xticklabels=class_names,
+                yticklabels=class_names)
+    
+    plt.title(title, fontsize=14, fontweight='bold')
+    plt.xlabel('Predicted Label', fontsize=12)
+    plt.ylabel('True Label', fontsize=12)
+    
+    # Add text annotations for better understanding
+    if not normalize:
+        tn, fp, fn, tp = cm.ravel() if cm.size == 4 else (0, 0, 0, 0)
+        
+        # Add labels
+        plt.text(0.1, 0.1, f'TN\n{tn}', ha='center', va='center', 
+                fontsize=10, fontweight='bold', color='darkblue')
+        plt.text(1.1, 0.1, f'FP\n{fp}', ha='center', va='center', 
+                fontsize=10, fontweight='bold', color='darkred')
+        plt.text(0.1, 1.1, f'FN\n{fn}', ha='center', va='center', 
+                fontsize=10, fontweight='bold', color='darkred')
+        plt.text(1.1, 1.1, f'TP\n{tp}', ha='center', va='center', 
+                fontsize=10, fontweight='bold', color='darkgreen')
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Confusion matrix saved to {save_path}")
 
 
 def visualize_sam_enhanced_results(
@@ -695,6 +1031,7 @@ def run_sam_enhanced_anomaly_detection(
     few_shot_mode: bool = False,
     n_shots: int = 5,
     save_visualizations: bool = True,
+    use_mirroring: bool = False,
 ):
     """
     Run SAM-enhanced anomaly detection on MVTec AD category.
@@ -713,21 +1050,31 @@ def run_sam_enhanced_anomaly_detection(
         use_sam_for_normal_masking: Whether to use SAM for masking normal objects
         few_shot_mode: Whether to use few-shot learning
         n_shots: Number of shots for few-shot learning
+        save_visualizations: Whether to save visualizations
+        use_mirroring: Whether to use mirroring for anomaly scoring
     """
-    mode_str = f"Few-Shot ({n_shots} shots)" if few_shot_mode else "Zero-Shot"
+    mode_str = "Mirroring" if use_mirroring else (f"Few-Shot ({n_shots})" if few_shot_mode else "Zero-Shot")
     print(f"\n{'='*70}")
-    print(f"SAM-Enhanced {mode_str} Anomaly Detection: {category}")
+    print(f"Run: {mode_str} Anomaly Detection: {category}")
     print(f"{'='*70}\n")
 
     # Setup output directory - make it relative to script location
     script_dir = Path(__file__).parent
     sam_suffix = "_sam" if sam_checkpoint else "_nosam"
-    shots_suffix = f"_fewshot_{n_shots}" if few_shot_mode else "_zeroshot"
-    output_dir = script_dir / output_dir / f"{category}{sam_suffix}{shots_suffix}"
+    if use_mirroring:
+        method_suffix = "_mirroring"
+    else:
+        method_suffix = f"_fewshot_{n_shots}" if few_shot_mode else "_zeroshot"
+    output_dir = script_dir / output_dir / f"{category}{sam_suffix}{method_suffix}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Initialize SAM
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # Initialize SAM with M2 MacBook optimization
+    if torch.backends.mps.is_available():
+        device = "mps"  # Apple Silicon GPU
+    elif torch.cuda.is_available():
+        device = "cuda"
+    else:
+        device = "cpu"
     sam_integrator = SAMIntegrator(sam_checkpoint, model_type=sam_model_type, device=device)
 
     # Initialize DINOv3 model
@@ -748,138 +1095,227 @@ def run_sam_enhanced_anomaly_detection(
         split='train',
         transform=transform,
     )
-    
-    # Apply few-shot sampling if needed
-    if few_shot_mode and n_shots > 0:
-        from torch.utils.data import Subset
-        import random
-        normal_indices = full_train_dataset.get_normal_samples()
-        if len(normal_indices) > n_shots:
-            random.seed(42)
-            selected_indices = random.sample(normal_indices, n_shots)
-            train_dataset = Subset(full_train_dataset, selected_indices)
-        else:
-            train_dataset = full_train_dataset
-        print(f"Few-shot training samples: {len(train_dataset)}")
-    else:
-        # Zero-shot (n_shots=0) or regular mode: use all training samples
-        train_dataset = full_train_dataset
-        if few_shot_mode and n_shots == 0:
-            print(f"Zero-shot mode: using all {len(train_dataset)} training samples")
-        else:
-            print(f"Training samples: {len(train_dataset)}")
-    
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, collate_fn=custom_collate_fn)
-
-    # SAM-Enhanced Normal Prototype Creation
-    if use_sam_for_normal_masking and sam_integrator.sam_available:
-        print("Creating SAM-enhanced normal prototypes...")
-        normal_images = []
-        for i in range(min(len(train_dataset), 10)):  # Use first 10 samples for SAM masking
-            sample = train_dataset[i] if hasattr(train_dataset, '__getitem__') else full_train_dataset[train_dataset.indices[i]]
-            # Convert tensor to numpy for SAM
-            img_tensor = sample['image']
-            # Denormalize
-            mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-            std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-            img_denorm = img_tensor * std + mean
-            img_np = (img_denorm.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-            normal_images.append(img_np)
-        
-        # Get SAM masks for normal objects
-        normal_masks = sam_integrator.segment_normal_objects(normal_images)
-        print(f"Generated {len(normal_masks)} SAM masks for normal objects")
-
-    # Extract training embeddings
-    train_embeddings = extractor.extract_embeddings_batch(
-        train_loader,
-        extract_patches=use_patches,
-        extract_cls=True,
+    train_loader = DataLoader(
+        full_train_dataset, 
+        batch_size=batch_size, 
+        shuffle=False, 
+        collate_fn=custom_collate_fn,
     )
-
-    # Get normal embeddings for reference
-    if use_patches:
-        normal_embeddings = train_embeddings['patch_embeddings']
-    else:
-        normal_embeddings = train_embeddings['cls_embeddings']
-
-    print(f"Normal embeddings shape: {normal_embeddings.shape}")
-
-    # Load test data
     print(f"\nLoading test data...")
-    test_dataset = MVTecADDataset(
-        root=root_dir,
-        category=category,
-        split='test',
-        transform=transform,
-    )
+    test_dataset = MVTecADDataset(root=root_dir, category=category, split='test', transform=transform)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=custom_collate_fn)
-
-    # Extract test embeddings
-    print(f"Test samples: {len(test_dataset)}")
-    test_embeddings = extractor.extract_embeddings_batch(
-        test_loader,
-        extract_patches=use_patches,
-        extract_cls=True,
-    )
-
-    if use_patches:
-        test_embed = test_embeddings['patch_embeddings']
+    
+    # Initialize variables that may be set differently based on mirroring
+    patch_level_scores = None
+    
+    # Apply Mirroring strategy if enabled
+    if use_mirroring:
+        print("Using Mirroring DINO strategy...")
+        # Initialize Detector (Patch size 14 for ViT-S/14, 16 for others. Adjust if needed)
+        p_size = 14 if 'vits14' in model_name or 'dinov2' in model_name else 16
+        if 'dinov3' in model_name: p_size = 14  # DINOv3 uses 14
+        
+        mirroring_detector = MirroringAnomalyDetector(extractor, image_size=image_size, patch_size=p_size)
+        
+        # "Train" (Estimate Baseline)
+        mirroring_detector.fit(train_loader)
+        
+        # Predict
+        anomaly_scores, patch_level_scores, labels_np = mirroring_detector.predict(test_loader)
+        test_labels = labels_np
+        
+        # Create test_embeddings dict for compatibility with evaluation code
+        test_embeddings = {'labels': labels_np}
+        
+        # Set dictionaries for compatibility with evaluation code below
+        anomaly_scores_cosine = anomaly_scores
+        anomaly_scores_euclidean = anomaly_scores # Placeholder
+        anomaly_scores_knn = anomaly_scores # Placeholder
+        k_cosine = 1
+        k_euclidean = 1
+        k_knn = 1
+        
     else:
-        test_embed = test_embeddings['cls_embeddings']
-
-    print(f"Test embeddings shape: {test_embed.shape}")
-
-    # Compute anomaly scores for all metrics
-    print(f"\nComputing anomaly scores for all metrics...")
-    
-    # Check if zero-shot mode (no few-shot flag or n_shots not provided)
-    is_zeroshot = not few_shot_mode
-    
-    # Determine k values for each metric
-    k_cosine = k_neighbors
-    k_euclidean = 1  # Use nearest neighbor for euclidean
-    k_knn = k_neighbors  # Use k-NN with k neighbors
-    
-    if use_patches:
-        if is_zeroshot:
-            # TRUE ZERO-SHOT: Use self-similarity (no reference to training data)
-            print(f"Using TRUE ZERO-SHOT mode (patch self-similarity)...")
-            
-            # For image-level scores, use mean of patch self-similarity scores
-            print(f"Computing zero-shot patch self-similarity scores...")
-            
-            # Get image paths for saving heatmaps
-            image_paths = [test_dataset[i]['image_path'] for i in range(len(test_dataset))]
-            
-            # Get images and labels for visualization
-            test_images = [test_dataset[i]['image'] for i in range(len(test_dataset))]
-            test_labels = test_embeddings['labels']
-            
-            # Compute zero-shot heatmaps and save them
-            zeroshot_heatmap_dir = output_dir / "zeroshot_heatmaps"
-            patch_level_scores = compute_patch_anomaly_scores_zeroshot(
-                test_embed,
-                metric='cosine',
-                save_dir=zeroshot_heatmap_dir if save_visualizations else None,
-                image_paths=image_paths,
-                image_size=image_size,
-                images=test_images if save_visualizations else None,
-                labels=test_labels,
-            )
-            
-            # Image-level anomaly score = mean of patch anomaly scores
-            anomaly_scores_cosine = patch_level_scores.mean(axis=1)
-            anomaly_scores_euclidean = anomaly_scores_cosine.copy()  # Same for zero-shot
-            anomaly_scores_knn = anomaly_scores_cosine.copy()  # Same for zero-shot
-            
-            print(f"Zero-shot patch-level scores shape: {patch_level_scores.shape}")
-            print(f"Zero-shot image-level scores shape: {anomaly_scores_cosine.shape}")
+        # Regular (non-mirroring) processing logic
+        
+        # Apply few-shot sampling if needed
+        if few_shot_mode and n_shots > 0:
+            from torch.utils.data import Subset
+            import random
+            normal_indices = full_train_dataset.get_normal_samples()
+            if len(normal_indices) > n_shots:
+                random.seed(42)
+                selected_indices = random.sample(normal_indices, n_shots)
+                train_dataset = Subset(full_train_dataset, selected_indices)
+            else:
+                train_dataset = full_train_dataset
+            print(f"Few-shot training samples: {len(train_dataset)}")
         else:
-            # FEW-SHOT: Compare against training samples
-            print(f"Using FEW-SHOT mode ({n_shots} shots)...")
+            # Zero-shot (n_shots=0) or regular mode: use all training samples
+            train_dataset = full_train_dataset
+            if few_shot_mode and n_shots == 0:
+                print(f"Zero-shot mode: using all {len(train_dataset)} training samples")
+            else:
+                print(f"Training samples: {len(train_dataset)}")
+        
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, collate_fn=custom_collate_fn)
+
+        # SAM-Enhanced Normal Prototype Creation
+        if use_sam_for_normal_masking and sam_integrator.sam_available:
+            print("Creating SAM-enhanced normal prototypes...")
+            normal_images = []
+            for i in range(min(len(train_dataset), 10)):  # Use first 10 samples for SAM masking
+                sample = train_dataset[i] if hasattr(train_dataset, '__getitem__') else full_train_dataset[train_dataset.indices[i]]
+                # Convert tensor to numpy for SAM
+                img_tensor = sample['image']
+                # Denormalize
+                mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+                std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+                img_denorm = img_tensor * std + mean
+                img_np = (img_denorm.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+                normal_images.append(img_np)
             
-            # Cosine similarity
+            # Get SAM masks for normal objects
+            normal_masks = sam_integrator.segment_normal_objects(normal_images)
+            print(f"Generated {len(normal_masks)} SAM masks for normal objects")
+
+        # Extract training embeddings
+        train_embeddings = extractor.extract_embeddings_batch(
+            train_loader,
+            extract_patches=use_patches,
+            extract_cls=True,
+        )
+
+        # Get normal embeddings for reference
+        if use_patches:
+            normal_embeddings = train_embeddings['patch_embeddings']
+        else:
+            normal_embeddings = train_embeddings['cls_embeddings']
+
+        print(f"Normal embeddings shape: {normal_embeddings.shape}")
+
+        # Load test data
+        print(f"\nLoading test data...")
+        test_dataset = MVTecADDataset(
+            root=root_dir,
+            category=category,
+            split='test',
+            transform=transform,
+        )
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=custom_collate_fn)
+
+        # Extract test embeddings
+        print(f"Test samples: {len(test_dataset)}")
+        test_embeddings = extractor.extract_embeddings_batch(
+            test_loader,
+            extract_patches=use_patches,
+            extract_cls=True,
+        )
+
+        if use_patches:
+            test_embed = test_embeddings['patch_embeddings']
+        else:
+            test_embed = test_embeddings['cls_embeddings']
+
+        print(f"Test embeddings shape: {test_embed.shape}")
+
+        # Compute anomaly scores for all metrics
+        print(f"\nComputing anomaly scores for all metrics...")
+        
+        # Check if zero-shot mode (no few-shot flag or n_shots not provided)
+        is_zeroshot = not few_shot_mode
+        
+        # Determine k values for each metric
+        k_cosine = k_neighbors
+        k_euclidean = 1  # Use nearest neighbor for euclidean
+        k_knn = k_neighbors  # Use k-NN with k neighbors
+        
+        if use_patches:
+            if is_zeroshot:
+                # TRUE ZERO-SHOT: Use self-similarity (no reference to training data)
+                print(f"Using TRUE ZERO-SHOT mode (patch self-similarity)...")
+                
+                # For image-level scores, use mean of patch self-similarity scores
+                print(f"Computing zero-shot patch self-similarity scores...")
+                
+                # Get image paths for saving heatmaps
+                image_paths = [test_dataset[i]['image_path'] for i in range(len(test_dataset))]
+                
+                # Get images and labels for visualization
+                test_images = [test_dataset[i]['image'] for i in range(len(test_dataset))]
+                test_labels = test_embeddings['labels']
+                
+                # Compute zero-shot heatmaps and save them
+                zeroshot_heatmap_dir = output_dir / "zeroshot_heatmaps"
+                patch_level_scores = compute_patch_anomaly_scores_zeroshot(
+                    test_embed,
+                    metric='cosine',
+                    save_dir=zeroshot_heatmap_dir if save_visualizations else None,
+                    image_paths=image_paths,
+                    image_size=image_size,
+                    images=test_images if save_visualizations else None,
+                    labels=test_labels,
+                )
+                
+                # Image-level anomaly score = mean of patch anomaly scores
+                anomaly_scores_cosine = patch_level_scores.mean(axis=1)
+                anomaly_scores_euclidean = anomaly_scores_cosine.copy()  # Same for zero-shot
+                anomaly_scores_knn = anomaly_scores_cosine.copy()  # Same for zero-shot
+                
+                print(f"Zero-shot patch-level scores shape: {patch_level_scores.shape}")
+                print(f"Zero-shot image-level scores shape: {anomaly_scores_cosine.shape}")
+            else:
+                # FEW-SHOT: Compare against training samples
+                print(f"Using FEW-SHOT mode ({n_shots} shots)...")
+                
+                # Cosine similarity
+                print(f"  Cosine similarity (k={k_cosine})...")
+                anomaly_scores_cosine = compute_anomaly_scores(
+                    test_embed,
+                    normal_embeddings,
+                    metric='cosine',
+                    k=k_cosine,
+                )
+                
+                # Euclidean distance
+                print(f"  Euclidean distance (k={k_euclidean})...")
+                anomaly_scores_euclidean = compute_anomaly_scores(
+                    test_embed,
+                    normal_embeddings,
+                    metric='euclidean',
+                    k=k_euclidean,
+                )
+                
+                # k-NN distance
+                print(f"  k-NN distance (k={k_knn})...")
+                anomaly_scores_knn = compute_anomaly_scores(
+                    test_embed,
+                    normal_embeddings,
+                    metric='knn',
+                    k=k_knn,
+                )
+                
+                # Compute patch-level scores for heatmap visualization (using cosine)
+                if test_embed.ndim == 3:  # (N, P, D) format
+                    print(f"Computing patch-level scores for heatmaps...")
+                    patch_level_scores = compute_patch_anomaly_scores(
+                        test_embed,
+                        normal_embeddings,
+                        metric='cosine',
+                    )
+                    print(f"Patch-level scores shape: {patch_level_scores.shape}")
+                else:
+                    patch_level_scores = None
+            
+            # Use cosine as primary metric (backward compatibility)
+            anomaly_scores = anomaly_scores_cosine
+            print(f"Image-level anomaly scores shape: {anomaly_scores.shape}")
+            
+        else:
+            # CLS token anomaly detection - always use few-shot approach
+            if is_zeroshot:
+                print("Warning: CLS token mode does not support true zero-shot. Using all training samples.")
+            
             print(f"  Cosine similarity (k={k_cosine})...")
             anomaly_scores_cosine = compute_anomaly_scores(
                 test_embed,
@@ -888,7 +1324,6 @@ def run_sam_enhanced_anomaly_detection(
                 k=k_cosine,
             )
             
-            # Euclidean distance
             print(f"  Euclidean distance (k={k_euclidean})...")
             anomaly_scores_euclidean = compute_anomaly_scores(
                 test_embed,
@@ -906,55 +1341,9 @@ def run_sam_enhanced_anomaly_detection(
                 k=k_knn,
             )
             
-            # Compute patch-level scores for heatmap visualization (using cosine)
-            if test_embed.ndim == 3:  # (N, P, D) format
-                print(f"Computing patch-level scores for heatmaps...")
-                patch_level_scores = compute_patch_anomaly_scores(
-                    test_embed,
-                    normal_embeddings,
-                    metric='cosine',
-                )
-                print(f"Patch-level scores shape: {patch_level_scores.shape}")
-            else:
-                patch_level_scores = None
-        
-        # Use cosine as primary metric (backward compatibility)
-        anomaly_scores = anomaly_scores_cosine
-        print(f"Image-level anomaly scores shape: {anomaly_scores.shape}")
-        
-    else:
-        # CLS token anomaly detection - always use few-shot approach
-        if is_zeroshot:
-            print("Warning: CLS token mode does not support true zero-shot. Using all training samples.")
-        
-        print(f"  Cosine similarity (k={k_cosine})...")
-        anomaly_scores_cosine = compute_anomaly_scores(
-            test_embed,
-            normal_embeddings,
-            metric='cosine',
-            k=k_cosine,
-        )
-        
-        print(f"  Euclidean distance (k={k_euclidean})...")
-        anomaly_scores_euclidean = compute_anomaly_scores(
-            test_embed,
-            normal_embeddings,
-            metric='euclidean',
-            k=k_euclidean,
-        )
-        
-        # k-NN distance
-        print(f"  k-NN distance (k={k_knn})...")
-        anomaly_scores_knn = compute_anomaly_scores(
-            test_embed,
-            normal_embeddings,
-            metric='knn',
-            k=k_knn,
-        )
-        
-        # Use cosine as primary metric
-        anomaly_scores = anomaly_scores_cosine
-        patch_level_scores = None
+            # Use cosine as primary metric
+            anomaly_scores = anomaly_scores_cosine
+            patch_level_scores = None
 
     print(f"Computed anomaly scores for {len(anomaly_scores)} test images")
 
@@ -1034,6 +1423,32 @@ def run_sam_enhanced_anomaly_detection(
     with open(metrics_file, 'w') as f:
         json.dump(metrics, f, indent=2)
     print(f"Saved metrics to {metrics_file}")
+    
+    # Create and save confusion matrix visualizations
+    if save_visualizations:
+        cm_dir = output_dir / "confusion_matrices"
+        cm_dir.mkdir(exist_ok=True)
+        
+        for metric_name, metric_data in metrics.items():
+            if metric_name != 'primary_metric' and 'confusion_matrix' in metric_data:
+                cm = metric_data['confusion_matrix']
+                
+                # Regular confusion matrix
+                cm_path = cm_dir / f"confusion_matrix_{metric_name}.png"
+                plot_confusion_matrix(
+                    cm, 
+                    cm_path, 
+                    title=f"Confusion Matrix - {metric_name.title()} Metric"
+                )
+                
+                # Normalized confusion matrix
+                cm_norm_path = cm_dir / f"confusion_matrix_{metric_name}_normalized.png"
+                plot_confusion_matrix(
+                    cm, 
+                    cm_norm_path, 
+                    title=f"Confusion Matrix - {metric_name.title()} Metric",
+                    normalize=True
+                )
 
     # Visualize samples
     if save_visualizations and visualize_samples > 0:
@@ -1144,7 +1559,7 @@ def main():
     parser.add_argument(
         "--root-dir",
         type=str,
-        default=str(Path(__file__).parent.parent / "mvtec_ad"),
+        default=str(Path(__file__).parent.parent.parent / "mvtec_ad"),
         help="Root directory of MVTec AD dataset"
     )
     parser.add_argument(
@@ -1230,7 +1645,12 @@ def main():
         default=None,
         help="Array of shot values to test, e.g., '1,3,5,10' (overrides --n-shots)"
     )
-
+    parser.add_argument(
+        "--use-mirroring", 
+        action="store_true", 
+        help="Enable Mirroring DINO strategy (Compare image vs flipped)"
+    )
+    
     args = parser.parse_args()
 
     # Parse shots array if provided
@@ -1252,9 +1672,18 @@ def main():
     if args.use_sam:
         # Auto-detect SAM checkpoint if not provided
         if args.sam_checkpoint is None:
+            # Check in sam_models directory first, then script directory
+            root_dir = Path(__file__).parent.parent.parent
+            sam_models_dir = root_dir / "sam_models"
             script_dir = Path(__file__).parent
+            
             # Check for SAM checkpoints in order of preference (largest/best first)
             sam_checkpoints = [
+                # First check sam_models directory
+                sam_models_dir / "sam_vit_h_4b8939.pth",
+                sam_models_dir / "sam_vit_l_0b3195.pth",
+                sam_models_dir / "sam_vit_b_01ec64.pth",
+                # Then check script directory
                 script_dir / "sam_vit_h_4b8939.pth",
                 script_dir / "sam_vit_l_0b3195.pth",
                 script_dir / "sam_vit_b_01ec64.pth",
@@ -1405,6 +1834,7 @@ def main():
                     few_shot_mode=args.few_shot,
                     n_shots=n_shots_value,
                     save_visualizations=args.save_visualizations,
+                    use_mirroring=args.use_mirroring,
                 )
                 all_metrics[category] = metrics
             except Exception as e:
