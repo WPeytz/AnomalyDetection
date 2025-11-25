@@ -80,21 +80,36 @@ class VisualPromptTuning(nn.Module):
         """
         # Forward through DINOv3 (frozen)
         with torch.no_grad():
-            # Use forward_features() to get patch tokens
-            if hasattr(self.dinov3, 'forward_features'):
+            # Use forward_features() or default forward to get embeddings
+            # HuggingFace models return a BaseModelOutputWithPooling object
+            if hasattr(self.dinov3, 'forward'):
+                output = self.dinov3(images)
+            elif hasattr(self.dinov3, 'forward_features'):
                 output = self.dinov3.forward_features(images)
             else:
                 output = self.dinov3(images, is_training=False)
 
         result = {}
+        cls_embed = None
+        patch_embed = None
 
         # Handle different output formats
         if isinstance(output, dict):
-            if return_cls and 'x_norm_clstoken' in output:
-                cls_embed = output['x_norm_clstoken']
-            if return_patches and 'x_norm_patchtokens' in output:
-                patch_embed = output['x_norm_patchtokens']
-        else:
+            # Could be Torch.hub format OR HuggingFace format (which is dict-like)
+            if 'x_norm_clstoken' in output:
+                # Torch.hub format
+                if return_cls:
+                    cls_embed = output['x_norm_clstoken']
+                if return_patches:
+                    patch_embed = output['x_norm_patchtokens']
+            elif 'last_hidden_state' in output:
+                # HuggingFace format (BaseModelOutputWithPooling is dict-like)
+                last_hidden = output['last_hidden_state']
+                if return_cls:
+                    cls_embed = last_hidden[:, 0]  # CLS token
+                if return_patches:
+                    patch_embed = last_hidden[:, 1:]  # Patch tokens
+        elif isinstance(output, torch.Tensor):
             # Fallback for tensor output
             if return_cls:
                 cls_embed = output[:, 0]
@@ -106,7 +121,7 @@ class VisualPromptTuning(nn.Module):
         batch_size = images.shape[0]
         prompt_expand = self.prompts.unsqueeze(0).expand(batch_size, -1, -1)  # [B, P, D]
 
-        if return_patches:
+        if return_patches and patch_embed is not None:
             # Compute attention between prompts and patches
             # This creates a connection between prompts and patch embeddings
             prompt_norm = prompt_expand / (prompt_expand.norm(dim=-1, keepdim=True) + 1e-8)
@@ -124,7 +139,7 @@ class VisualPromptTuning(nn.Module):
 
             result['patch_embeddings'] = patch_embed
 
-        if return_cls:
+        if return_cls and cls_embed is not None:
             # Similar modulation for CLS token
             cls_expand = cls_embed.unsqueeze(1)  # [B, 1, D]
 

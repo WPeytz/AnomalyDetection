@@ -168,13 +168,27 @@ class DINOv3EmbeddingExtractor:
             images = batch['image']
             labels = batch['label']
 
-            embeddings = self.extract_patch_embeddings(images, return_cls_token=extract_cls)
-
-            if extract_cls:
-                cls_embeddings_list.append(embeddings['cls_token'].cpu().numpy())
-
-            if extract_patches:
-                patch_embeddings_list.append(embeddings['patch_embeddings'].cpu().numpy())
+            # Check if we have a prompt model to use
+            if hasattr(self, 'prompt_model') and self.prompt_model is not None:
+                # Use prompt-tuned embeddings
+                embeddings = self.prompt_model(
+                    images.to(self.device),
+                    return_cls=extract_cls,
+                    return_patches=extract_patches
+                )
+                # Prompt model uses 'cls_embeddings' and 'patch_embeddings' keys
+                if extract_cls and 'cls_embeddings' in embeddings:
+                    cls_embeddings_list.append(embeddings['cls_embeddings'].cpu().numpy())
+                if extract_patches and 'patch_embeddings' in embeddings:
+                    patch_embeddings_list.append(embeddings['patch_embeddings'].cpu().numpy())
+            else:
+                # Use standard embeddings
+                embeddings = self.extract_patch_embeddings(images, return_cls_token=extract_cls)
+                # Standard extraction uses 'cls_token' and 'patch_embeddings' keys
+                if extract_cls:
+                    cls_embeddings_list.append(embeddings['cls_token'].cpu().numpy())
+                if extract_patches:
+                    patch_embeddings_list.append(embeddings['patch_embeddings'].cpu().numpy())
 
             labels_list.append(labels.numpy())
 
