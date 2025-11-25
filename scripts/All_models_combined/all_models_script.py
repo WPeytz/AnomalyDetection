@@ -27,6 +27,16 @@ import warnings
 from embedding_extractor import DINOv3EmbeddingExtractor, compute_anomaly_scores
 from mvtec_dataset import MVTecADDataset, get_mvtec_transforms
 
+# Import prompt tuning module (optional)
+try:
+    import sys
+    sys.path.append(str(Path(__file__).parent.parent.parent / "prompt_based_feature_adaption"))
+    from prompt_model import VisualPromptTuning
+    PROMPTS_AVAILABLE = True
+except ImportError:
+    PROMPTS_AVAILABLE = False
+    print("Warning: prompt_model not found - prompt tuning will not be available")
+
 # Check SAM availability
 try:
     from segment_anything import SamPredictor, sam_model_registry
@@ -695,6 +705,8 @@ def run_sam_enhanced_anomaly_detection(
     few_shot_mode: bool = False,
     n_shots: int = 5,
     save_visualizations: bool = True,
+    use_prompts: bool = False,
+    prompt_checkpoint: Optional[str] = None,
 ):
     """
     Run SAM-enhanced anomaly detection on MVTec AD category.
@@ -723,7 +735,8 @@ def run_sam_enhanced_anomaly_detection(
     script_dir = Path(__file__).parent
     sam_suffix = "_sam" if sam_checkpoint else "_nosam"
     shots_suffix = f"_fewshot_{n_shots}" if few_shot_mode else "_zeroshot"
-    output_dir = script_dir / output_dir / f"{category}{sam_suffix}{shots_suffix}"
+    prompts_suffix = "_prompts" if use_prompts else ""
+    output_dir = script_dir / output_dir / f"{category}{sam_suffix}{shots_suffix}{prompts_suffix}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Initialize SAM
@@ -736,6 +749,47 @@ def run_sam_enhanced_anomaly_detection(
         model_name=model_name,
         use_huggingface=True,
     )
+
+    # Load prompt tuning if requested
+    prompt_model = None
+    if use_prompts:
+        if not PROMPTS_AVAILABLE:
+            print("Error: Prompt tuning requested but prompt_model not available")
+            print("Make sure prompt_based_feature_adaption module is accessible")
+            return
+
+        if not prompt_checkpoint:
+            print("Error: --use-prompts requires --prompt-checkpoint to be specified")
+            return
+
+        if not Path(prompt_checkpoint).exists():
+            print(f"Error: Prompt checkpoint not found: {prompt_checkpoint}")
+            return
+
+        print(f"Loading prompt checkpoint from {prompt_checkpoint}...")
+        checkpoint = torch.load(prompt_checkpoint, map_location='cpu', weights_only=False)
+
+        # Extract prompt configuration from checkpoint
+        num_prompts = checkpoint.get('num_prompts', 10)
+        embed_dim = checkpoint['prompts'].shape[1]
+
+        # Wrap extractor model with VisualPromptTuning
+        prompt_model = VisualPromptTuning(
+            dinov3_model=extractor.model,
+            num_prompts=num_prompts,
+            embed_dim=embed_dim,
+        )
+
+        # Load trained prompts
+        prompt_model.prompts.data = checkpoint['prompts']
+        prompt_model.eval()
+
+        # Attach prompt model to extractor (don't replace the model itself)
+        extractor.prompt_model = prompt_model
+
+        print(f"✓ Loaded {num_prompts} prompt tokens (dim={embed_dim})")
+        print(f"  Category: {checkpoint.get('category', 'unknown')}")
+        print(f"  Original model: {checkpoint.get('model_name', 'unknown')}")
 
     # Setup transforms
     transform = get_mvtec_transforms(image_size)
@@ -1230,6 +1284,17 @@ def main():
         default=None,
         help="Array of shot values to test, e.g., '1,3,5,10' (overrides --n-shots)"
     )
+    parser.add_argument(
+        "--use-prompts",
+        action="store_true",
+        help="Enable prompt-based feature adaptation"
+    )
+    parser.add_argument(
+        "--prompt-checkpoint",
+        type=str,
+        default=None,
+        help="Path to trained prompt checkpoint (e.g., checkpoints/screw_prompts.pt)"
+    )
 
     args = parser.parse_args()
 
@@ -1343,6 +1408,8 @@ def main():
                         output_dir=multi_shot_output,
                         visualize_samples=args.visualize_samples,
                         sam_checkpoint=args.sam_checkpoint,
+                        use_prompts=args.use_prompts,
+                        prompt_checkpoint=args.prompt_checkpoint,
                         sam_model_type=sam_model_type if args.sam_checkpoint else "vit_l",
                         use_sam_for_normal_masking=args.use_sam_masking,
                         few_shot_mode=True,
@@ -1405,6 +1472,8 @@ def main():
                     few_shot_mode=args.few_shot,
                     n_shots=n_shots_value,
                     save_visualizations=args.save_visualizations,
+                    use_prompts=args.use_prompts,
+                    prompt_checkpoint=args.prompt_checkpoint,
                 )
                 all_metrics[category] = metrics
             except Exception as e:
