@@ -26,17 +26,6 @@ import warnings
 # Import local modules
 from embedding_extractor import DINOv3EmbeddingExtractor, compute_anomaly_scores
 from mvtec_dataset import MVTecADDataset, get_mvtec_transforms
-import seaborn as sns
-
-# Import prompt tuning module (optional)
-try:
-    import sys
-    sys.path.append(str(Path(__file__).parent.parent.parent / "prompt_based_feature_adaption"))
-    from prompt_model import VisualPromptTuning
-    PROMPTS_AVAILABLE = True
-except ImportError:
-    PROMPTS_AVAILABLE = False
-    print("Warning: prompt_model not found - prompt tuning will not be available")
 
 # Check SAM availability
 try:
@@ -80,13 +69,8 @@ def compute_patch_anomaly_scores_zeroshot(
     
     N, P, D = test_embeddings.shape
     
-    # Convert to torch tensors and conditional for NVIDIA GPU, Apple Silicon or cpu
-    if torch.backends.mps.is_available():
-        device = 'mps'  # Apple Silicon GPU
-    elif torch.cuda.is_available():
-        device = 'cuda'
-    else:
-        device = 'cpu'
+    # Convert to torch tensors and move to GPU
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
     test_torch = torch.from_numpy(test_embeddings).float().to(device)
     
     all_patch_scores = []
@@ -185,13 +169,8 @@ def compute_patch_anomaly_scores(
     N, P, D = test_embeddings.shape
     M = normal_embeddings.shape[0]
     
-    # Convert to torch tensors and conditional for NVIDIA GPU, Apple Silicon or cpu
-    if torch.backends.mps.is_available():
-        device = 'mps'  # Apple Silicon GPU
-    elif torch.cuda.is_available():
-        device = 'cuda'
-    else:
-        device = 'cpu'
+    # Convert to torch tensors and move to GPU
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
     test_torch = torch.from_numpy(test_embeddings).float().to(device)
     normal_torch = torch.from_numpy(normal_embeddings).float().to(device)
     
@@ -240,18 +219,11 @@ class SAMIntegrator:
         Args:
             sam_checkpoint: Path to SAM checkpoint file
             model_type: SAM model type ('vit_h', 'vit_l', 'vit_b')
-            device: Device to use ('cuda', 'mps', or 'cpu')
+            device: Device to use ('cuda' or 'cpu')
         """
         self.sam_available = SAM_AVAILABLE and sam_checkpoint is not None
         self.predictor = None
-        
-        # Optimize device selection for M2 MacBook
-        if device == "mps" and torch.backends.mps.is_available():
-            self.device = "mps"
-        elif device == "cuda" and torch.cuda.is_available():
-            self.device = "cuda"
-        else:
-            self.device = "cpu"
+        self.device = device if torch.cuda.is_available() else "cpu"
         
         if self.sam_available:
             try:
@@ -269,18 +241,19 @@ class SAMIntegrator:
             else:
                 print("SAM checkpoint not provided - using fallback methods")
     
-    def get_bbox_from_anomaly_map(self, anomaly_map: np.ndarray, threshold_percentile: float = 60) -> Tuple[int, int, int, int]:
+    def get_bbox_from_anomaly_map(self, anomaly_map: np.ndarray, threshold_percentile: float = 85) -> Tuple[int, int, int, int]:
         """
         Extract bounding box from anomaly heatmap.
         
         Args:
             anomaly_map: 2D anomaly heatmap
-            threshold_percentile: Percentile for thresholding (lower = more area captured)
+            threshold_percentile: Percentile for thresholding (higher = less area, more conservative)
+                                 Default 85 focuses on top 15% hottest regions
             
         Returns:
             Bounding box (x_min, y_min, x_max, y_max)
         """
-        # Threshold the map
+        # Threshold the map - use higher percentile to focus on hottest regions only
         threshold = np.percentile(anomaly_map, threshold_percentile)
         binary_map = anomaly_map > threshold
         
@@ -325,54 +298,39 @@ class SAMIntegrator:
         try:
             self.predictor.set_image(image)
             
-            # Use point prompts from heatmap peaks if available
+            # Use point prompts from heatmap peaks if available (NO BBOX for more precision)
+            # Use the bounding box as SAM prompt (box) for segmentation
             if anomaly_map is not None:
-                # Get top hotspot locations from anomaly map
-                threshold = np.percentile(anomaly_map, 90)  # Top 10% hottest areas
-                hot_mask = anomaly_map > threshold
-                
-                # Find peak coordinates
-                coords = np.where(hot_mask)
-                if len(coords[0]) > 0:
-                    # Sample up to 5 points from hottest regions
-                    n_points = min(5, len(coords[0]))
-                    # Get indices of hottest points
-                    flat_indices = np.argsort(anomaly_map[coords[0], coords[1]])[-n_points:]
-                    point_coords = np.array([[coords[1][i], coords[0][i]] for i in flat_indices])
-                    point_labels = np.ones(len(point_coords), dtype=int)  # All positive prompts
-                    
-                    # Use both points and bbox for better segmentation
-                    input_box = np.array([bbox])
-                    masks, scores, logits = self.predictor.predict(
-                        point_coords=point_coords,
-                        point_labels=point_labels,
-                        box=input_box,
-                        multimask_output=True,  # Get multiple options
-                    )
-                    
-                    # Select mask that best matches the anomaly region
-                    # Prefer smaller, more focused masks
-                    best_idx = np.argmin([m.sum() for m in masks])  # Smallest mask
-                    mask = masks[best_idx]
-                    
-                    # Apply morphological operations to clean up noise
-                    mask = self._clean_mask(mask)
-                    return mask
+                # Use the provided bbox to constrain SAM prediction
+                x_min, y_min, x_max, y_max = bbox
+                box_np = np.array([x_min, y_min, x_max, y_max])
+                masks, scores, logits = self.predictor.predict(
+                    box=box_np,
+                    multimask_output=True,
+                )
+                # Select the mask with the highest score to prefer confident masks
+                try:
+                    best_idx = int(np.argmax(scores))
+                except Exception:
+                    best_idx = 0
+                mask = masks[best_idx]
+                # Apply morphological cleaning (conservative)
+                mask = self._clean_mask(mask, kernel_size=5, min_area=100)
+                return mask
             
-            # Fallback to bbox-only if no heatmap
-            input_box = np.array([bbox])
+            # Fallback: still use bbox if anomaly_map isn't available
+            x_min, y_min, x_max, y_max = bbox
+            box_np = np.array([x_min, y_min, x_max, y_max])
             masks, scores, logits = self.predictor.predict(
-                point_coords=None,
-                point_labels=None,
-                box=input_box,
+                box=box_np,
                 multimask_output=True,
             )
-            # Choose smallest mask to avoid over-segmentation
-            best_idx = np.argmin([m.sum() for m in masks])
+            try:
+                best_idx = int(np.argmax(scores))
+            except Exception:
+                best_idx = 0
             mask = masks[best_idx]
-            
-            # Apply morphological operations to clean up noise
-            mask = self._clean_mask(mask)
+            mask = self._clean_mask(mask, kernel_size=5, min_area=100)
             return mask
             
         except Exception as e:
@@ -459,197 +417,6 @@ class SAMIntegrator:
         
         return masks
 
-class FlippedDataset(torch.utils.data.Dataset):
-    """Wrapper to return horizontally flipped images."""
-    def __init__(self, dataset):
-        self.dataset = dataset
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def __getitem__(self, idx):
-        # Handle subset or original dataset
-        if hasattr(self.dataset, 'dataset'):
-             # If it's a Subset
-             sample = self.dataset.dataset[self.dataset.indices[idx]]
-        else:
-             sample = self.dataset[idx]
-             
-        # Create a shallow copy to avoid modifying the original cache
-        sample = sample.copy()
-        # Flip image tensor (C, H, W) -> Flip on last dimension (W)
-        sample['image'] = torch.flip(sample['image'], dims=[-1])
-        return sample
-
-class MirroringAnomalyDetector:
-    """
-    Implements the Mirroring DINO strategy: comparing an image with its flipped version.
-    """
-    def __init__(self, extractor, image_size=224, patch_size=14):
-        self.extractor = extractor
-        self.image_size = image_size
-        self.patch_size = patch_size
-        # Grid size: For patch_size=14 on 224x224 image, we get 224/14=16 patches per side
-        # BUT the actual spatial grid is 14x14=196 patches (not 16x16=256)
-        # This is because DINOv3 uses overlapping patches or different stride
-        self.grid_h = 14  # Actual spatial grid size for DINOv3
-        self.grid_w = 14
-        self.baseline_mean = 0
-        self.baseline_std = 1
-
-    def _align_flipped_patches(self, flipped_embeddings):
-        """
-        Re-aligns embeddings from a flipped image to match the original spatial grid.
-        Input: (N, P, D)
-        """
-        N, P, D = flipped_embeddings.shape
-        expected_patches = self.grid_h * self.grid_w  # 14*14 = 196 for DINOv3
-        
-        # Detect and handle register tokens (usually 4 in DINOv3)
-        n_registers = 0
-        if P > expected_patches:
-            n_registers = P - expected_patches
-            
-        # Separate registers and spatial tokens
-        registers = flipped_embeddings[:, :n_registers, :]
-        spatial = flipped_embeddings[:, n_registers:, :]
-        
-        # Check if spatial patches match expected grid
-        current_P = spatial.shape[1]
-        
-        if current_P == expected_patches:
-            # Perfect match: 196 spatial patches for 14x14 grid
-            h, w = self.grid_h, self.grid_w
-            
-            try:
-                spatial_grid = spatial.reshape(N, h, w, D)
-                
-                # Flip back horizontally (axis 2 is Width)
-                spatial_grid_flipped = torch.flip(torch.tensor(spatial_grid), dims=[2]).numpy()
-                
-                # Flatten back
-                spatial_restored = spatial_grid_flipped.reshape(N, current_P, D)
-                
-                # Recombine with registers
-                if n_registers > 0:
-                    return np.concatenate([registers, spatial_restored], axis=1)
-                return spatial_restored
-                
-            except Exception as e:
-                print(f"Warning: Patch reshaping failed: {e}")
-                print(f"Using fallback: returning original embeddings")
-                return flipped_embeddings
-        else:
-            # Mismatch: try to auto-detect grid or use fallback
-            print(f"Warning: Spatial patch count mismatch.")
-            print(f"Expected: {expected_patches} ({self.grid_h}x{self.grid_w}), Got: {current_P}")
-            
-            # Try to detect if it's a perfect square
-            h = int(np.sqrt(current_P))
-            if h * h == current_P:
-                print(f"Auto-detected {h}x{h} grid for {current_P} patches")
-                try:
-                    spatial_grid = spatial.reshape(N, h, h, D)
-                    spatial_grid_flipped = torch.flip(torch.tensor(spatial_grid), dims=[2]).numpy()
-                    spatial_restored = spatial_grid_flipped.reshape(N, current_P, D)
-                    
-                    if n_registers > 0:
-                        return np.concatenate([registers, spatial_restored], axis=1)
-                    return spatial_restored
-                    
-                except Exception as e:
-                    print(f"Auto-detection failed: {e}")
-                    
-            print("Using fallback: returning original embeddings")
-            return flipped_embeddings
-
-    def fit(self, train_loader):
-        """
-        'Training' phase: Compute symmetry error on normal data to establish a baseline.
-        """
-        print("Training Mirroring Model (Estimating Normal Symmetry Error)...")
-        
-        # 1. Get Original Embeddings
-        orig_results = self.extractor.extract_embeddings_batch(
-            train_loader, extract_patches=True, extract_cls=False
-        )
-        orig_patches = orig_results['patch_embeddings']
-        
-        # 2. Get Flipped Embeddings
-        # Create a flipped version of the dataset/loader
-        train_dataset_flipped = FlippedDataset(train_loader.dataset)
-        flipped_loader = DataLoader(
-            train_dataset_flipped, 
-            batch_size=train_loader.batch_size, 
-            shuffle=False, 
-            collate_fn=train_loader.collate_fn
-        )
-        
-        flip_results = self.extractor.extract_embeddings_batch(
-            flipped_loader, extract_patches=True, extract_cls=False
-        )
-        flip_patches = flip_results['patch_embeddings']
-        
-        # 3. Align Flipped Patches Back
-        flip_patches_aligned = self._align_flipped_patches(flip_patches)
-        
-        # 4. Compute Patch-wise Cosine Distance
-        # Normalize
-        orig_norm = orig_patches / (np.linalg.norm(orig_patches, axis=-1, keepdims=True) + 1e-8)
-        flip_norm = flip_patches_aligned / (np.linalg.norm(flip_patches_aligned, axis=-1, keepdims=True) + 1e-8)
-        
-        # Cosine similarity per patch
-        sim_per_patch = (orig_norm * flip_norm).sum(axis=-1)
-        dist_per_patch = 1 - sim_per_patch
-        
-        # Image-level score: Max patch error (most asymmetric part)
-        image_scores = dist_per_patch.max(axis=1)
-        
-        self.baseline_mean = np.mean(image_scores)
-        self.baseline_std = np.std(image_scores)
-        
-        print(f"  Normal Baseline: Mean={self.baseline_mean:.4f}, Std={self.baseline_std:.4f}")
-
-    def predict(self, test_loader):
-        """
-        Evaluation phase: Compute symmetry error for test images.
-        """
-        print("Evaluating with Mirroring Strategy...")
-        
-        # 1. Original
-        orig_results = self.extractor.extract_embeddings_batch(
-            test_loader, extract_patches=True, extract_cls=False
-        )
-        orig_patches = orig_results['patch_embeddings']
-        
-        # 2. Flipped
-        test_dataset_flipped = FlippedDataset(test_loader.dataset)
-        flipped_loader = DataLoader(
-            test_dataset_flipped, 
-            batch_size=test_loader.batch_size, 
-            shuffle=False, 
-            collate_fn=test_loader.collate_fn
-        )
-        flip_results = self.extractor.extract_embeddings_batch(
-            flipped_loader, extract_patches=True, extract_cls=False
-        )
-        flip_patches = flip_results['patch_embeddings']
-        
-        # 3. Align
-        flip_patches_aligned = self._align_flipped_patches(flip_patches)
-        
-        # 4. Compute Scores
-        orig_norm = orig_patches / (np.linalg.norm(orig_patches, axis=-1, keepdims=True) + 1e-8)
-        flip_norm = flip_patches_aligned / (np.linalg.norm(flip_patches_aligned, axis=-1, keepdims=True) + 1e-8)
-        
-        sim_per_patch = (orig_norm * flip_norm).sum(axis=-1)
-        dist_per_patch = 1 - sim_per_patch
-        
-        # Image-level anomaly score
-        raw_scores = dist_per_patch.max(axis=1)
-        
-        return raw_scores, dist_per_patch, orig_results['labels']
-
 
 def create_anomaly_heatmap(patch_scores: np.ndarray, patch_size: int = 16, image_size: int = 224) -> np.ndarray:
     """
@@ -709,10 +476,153 @@ def custom_collate_fn(batch):
     }
 
 
+def load_ground_truth_mask(image_path: str, root_dir: str, category: str) -> Optional[np.ndarray]:
+    """
+    Load ground truth mask for a test image from MVTec dataset.
+    
+    Args:
+        image_path: Path to the test image
+        root_dir: Root directory of MVTec dataset
+        category: Category name (e.g., 'bottle', 'cable')
+    
+    Returns:
+        Binary ground truth mask (H, W) or None if not available
+    """
+    # Parse the image path to get defect type and filename
+    # Expected structure: .../category/test/<defect_type>/<filename>.png
+    image_path = Path(image_path)
+    
+    # Get defect type from path
+    defect_type = image_path.parent.name
+    
+    # If it's a 'good' sample, there's no ground truth mask
+    if defect_type == 'good':
+        return None
+    
+    # Build ground truth path
+    # Structure: root_dir/category/ground_truth/<defect_type>/<filename>_mask.png
+    filename_stem = image_path.stem  # filename without extension
+    
+    # Try different possible naming conventions
+    possible_paths = [
+        Path(root_dir) / category / 'ground_truth' / defect_type / f"{filename_stem}_mask.png",
+        Path(root_dir) / category / 'ground_truth' / defect_type / f"{filename_stem}.png",
+        Path(root_dir) / category / 'groundtruth' / defect_type / f"{filename_stem}_mask.png",
+        Path(root_dir) / category / 'groundtruth' / defect_type / f"{filename_stem}.png",
+    ]
+    
+    for gt_path in possible_paths:
+        if gt_path.exists():
+            # Load and convert to binary mask
+            gt_mask = cv2.imread(str(gt_path), cv2.IMREAD_GRAYSCALE)
+            if gt_mask is not None:
+                # Convert to binary (threshold at 127)
+                gt_mask = (gt_mask > 127).astype(np.uint8)
+                return gt_mask
+    
+    return None
+
+
+def evaluate_mask_segmentation(
+    pred_masks: List[Optional[np.ndarray]],
+    gt_masks: List[Optional[np.ndarray]],
+) -> dict:
+    """
+    Evaluate segmentation mask quality against ground truth.
+    Only evaluates anomalous samples (skips None ground truth masks).
+    
+    Args:
+        pred_masks: List of predicted binary masks
+        gt_masks: List of ground truth binary masks
+    
+    Returns:
+        Dictionary with pixel-level evaluation metrics (Precision, Recall, Dice, Accuracy, IoU)
+    """
+    from sklearn.metrics import accuracy_score, precision_score, recall_score
+    
+    all_pred = []
+    all_gt = []
+    num_anomalous_samples = 0
+    
+    # Flatten all masks for pixel-level evaluation
+    # Only process anomalous samples (where gt_mask is not None)
+    for pred_mask, gt_mask in zip(pred_masks, gt_masks):
+        # Skip if ground truth is None (normal/good samples)
+        if gt_mask is None:
+            continue
+        
+        # Skip if predicted mask is None
+        if pred_mask is None:
+            continue
+        
+        # Count anomalous samples
+        num_anomalous_samples += 1
+        
+        # Ensure both masks are the same size
+        if pred_mask.shape != gt_mask.shape:
+            # Resize predicted mask to match ground truth
+            pred_mask = cv2.resize(pred_mask.astype(np.uint8), 
+                                 (gt_mask.shape[1], gt_mask.shape[0]), 
+                                 interpolation=cv2.INTER_NEAREST)
+        
+        # Flatten and collect
+        all_pred.extend(pred_mask.flatten())
+        all_gt.extend(gt_mask.flatten())
+    
+    if len(all_pred) == 0:
+        return {
+            'pixel_precision': 0.0,
+            'pixel_recall': 0.0,
+            'dice_coefficient': 0.0,
+            'pixel_accuracy': 0.0,
+            'iou': 0.0,
+            'num_evaluated_pixels': 0,
+            'num_anomalous_samples': 0,
+        }
+    
+    # Convert to numpy arrays
+    all_pred = np.array(all_pred)
+    all_gt = np.array(all_gt)
+    
+    # Compute basic metrics
+    accuracy = accuracy_score(all_gt, all_pred)
+    
+    # Precision and recall (handle edge cases)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        precision = precision_score(all_gt, all_pred, zero_division=0)
+        recall = recall_score(all_gt, all_pred, zero_division=0)
+    
+    # Compute Dice coefficient (F1 score for binary segmentation)
+    # Dice = 2 * TP / (2 * TP + FP + FN) = 2 * Precision * Recall / (Precision + Recall)
+    if precision + recall > 0:
+        dice = 2 * precision * recall / (precision + recall)
+    else:
+        dice = 0.0
+    
+    # Compute IoU (Intersection over Union)
+    # IoU = TP / (TP + FP + FN)
+    intersection = np.sum(all_pred & all_gt)
+    union = np.sum(all_pred | all_gt)
+    if union > 0:
+        iou = intersection / union
+    else:
+        iou = 0.0
+    
+    return {
+        'pixel_precision': float(precision),
+        'pixel_recall': float(recall),
+        'dice_coefficient': float(dice),
+        'pixel_accuracy': float(accuracy),
+        'iou': float(iou),
+        'num_evaluated_pixels': len(all_pred),
+        'num_anomalous_samples': num_anomalous_samples,
+    }
+
+
 def evaluate_anomaly_detection(
     anomaly_scores: np.ndarray,
     labels: np.ndarray,
-    threshold: Optional[float] = None
 ) -> dict:
     """
     Evaluate anomaly detection performance.
@@ -720,144 +630,31 @@ def evaluate_anomaly_detection(
     Args:
         anomaly_scores: Anomaly scores (N,)
         labels: Ground truth labels (N,) - 0 for normal, 1 for anomaly
-        threshold: Classification threshold (if None, uses optimal threshold from ROC)
 
     Returns:
-        Dictionary with evaluation metrics including confusion matrix values
+        Dictionary with evaluation metrics
     """
-    from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_score, roc_curve
+    from sklearn.metrics import precision_recall_curve, f1_score
     
-    # Compute AUC metrics
+    # Compute metrics
     auroc = roc_auc_score(labels, anomaly_scores)
     ap = average_precision_score(labels, anomaly_scores)
     
-    # Determine threshold if not provided
-    if threshold is None:
-        # Use Youden's index (optimal threshold from ROC curve)
-        fpr, tpr, thresholds = roc_curve(labels, anomaly_scores)
-        optimal_idx = np.argmax(tpr - fpr)
-        threshold = thresholds[optimal_idx]
-    
-    # Make binary predictions
-    predictions = (anomaly_scores >= threshold).astype(int)
-    
-    # Compute confusion matrix
-    cm = confusion_matrix(labels, predictions)
-    
-    # Extract TP, FP, TN, FN
-    if cm.shape == (2, 2):
-        tn, fp, fn, tp = cm.ravel()
-    else:
-        # Handle edge case where only one class is present
-        if len(np.unique(labels)) == 1:
-            if labels[0] == 0:  # Only normal samples
-                tn = len(labels) - np.sum(predictions)
-                fp = np.sum(predictions)
-                fn, tp = 0, 0
-            else:  # Only anomaly samples
-                tp = np.sum(predictions)
-                fn = len(labels) - np.sum(predictions)
-                tn, fp = 0, 0
-        else:
-            tn, fp, fn, tp = 0, 0, 0, 0
-    
-    # Compute additional metrics
-    precision = precision_score(labels, predictions, zero_division=0)
-    recall = recall_score(labels, predictions, zero_division=0)
-    f1 = f1_score(labels, predictions, zero_division=0)
-    
-    # Compute accuracy
-    accuracy = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else 0
-    
-    # Compute specificity (True Negative Rate)
-    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+    # Compute precision and recall at optimal threshold (maximize F1)
+    precision_vals, recall_vals, thresholds = precision_recall_curve(labels, anomaly_scores)
+    f1_scores = 2 * (precision_vals * recall_vals) / (precision_vals + recall_vals + 1e-10)
+    optimal_idx = np.argmax(f1_scores)
+    optimal_precision = precision_vals[optimal_idx]
+    optimal_recall = recall_vals[optimal_idx]
+    optimal_f1 = f1_scores[optimal_idx]
 
     return {
         'auroc': float(auroc),
         'average_precision': float(ap),
-        'threshold': float(threshold),
-        'accuracy': float(accuracy),
-        'precision': float(precision),
-        'recall': float(recall),
-        'f1_score': float(f1),
-        'specificity': float(specificity),
-        'true_positives': int(tp),
-        'false_positives': int(fp),
-        'true_negatives': int(tn),
-        'false_negatives': int(fn),
-        'confusion_matrix': cm.tolist()
+        'precision': float(optimal_precision),
+        'recall': float(optimal_recall),
+        'f1_score': float(optimal_f1),
     }
-
-
-def plot_confusion_matrix(
-    confusion_matrix: np.ndarray,
-    save_path: Path,
-    class_names: List[str] = None,
-    title: str = "Confusion Matrix",
-    normalize: bool = False
-) -> None:
-    """
-    Create and save a confusion matrix visualization.
-    
-    Args:
-        confusion_matrix: 2x2 confusion matrix array
-        save_path: Path to save the plot
-        class_names: Names for the classes (default: ['Normal', 'Anomaly'])
-        title: Plot title
-        normalize: Whether to normalize the values
-    """
-    if class_names is None:
-        class_names = ['Normal', 'Anomaly']
-    
-    # Convert to numpy array if needed
-    if isinstance(confusion_matrix, list):
-        cm = np.array(confusion_matrix)
-    else:
-        cm = confusion_matrix
-    
-    # Normalize if requested
-    if normalize:
-        cm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
-        fmt = '.2f'
-        title += ' (Normalized)'
-    else:
-        fmt = 'd'
-    
-    # Create figure
-    plt.figure(figsize=(8, 6))
-    
-    # Create heatmap
-    sns.heatmap(cm, 
-                annot=True, 
-                fmt=fmt, 
-                cmap='Blues',
-                square=True,
-                cbar_kws={'label': 'Count' if not normalize else 'Proportion'},
-                xticklabels=class_names,
-                yticklabels=class_names)
-    
-    plt.title(title, fontsize=14, fontweight='bold')
-    plt.xlabel('Predicted Label', fontsize=12)
-    plt.ylabel('True Label', fontsize=12)
-    
-    # Add text annotations for better understanding
-    if not normalize:
-        tn, fp, fn, tp = cm.ravel() if cm.size == 4 else (0, 0, 0, 0)
-        
-        # Add labels
-        plt.text(0.1, 0.1, f'TN\n{tn}', ha='center', va='center', 
-                fontsize=10, fontweight='bold', color='darkblue')
-        plt.text(1.1, 0.1, f'FP\n{fp}', ha='center', va='center', 
-                fontsize=10, fontweight='bold', color='darkred')
-        plt.text(0.1, 1.1, f'FN\n{fn}', ha='center', va='center', 
-                fontsize=10, fontweight='bold', color='darkred')
-        plt.text(1.1, 1.1, f'TP\n{tp}', ha='center', va='center', 
-                fontsize=10, fontweight='bold', color='darkgreen')
-    
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"Confusion matrix saved to {save_path}")
 
 
 def visualize_sam_enhanced_results(
@@ -869,6 +666,7 @@ def visualize_sam_enhanced_results(
     defect_type: str,
     save_path: Path = Path(__file__).parent,
     bbox: Optional[Tuple[int, int, int, int]] = None,
+    gt_mask: Optional[np.ndarray] = None,
 ):
     """
     Visualize SAM-enhanced anomaly detection results.
@@ -882,6 +680,7 @@ def visualize_sam_enhanced_results(
         defect_type: Defect type name
         save_path: Path to save the visualization
         bbox: Bounding box from anomaly heatmap (x_min, y_min, x_max, y_max)
+        gt_mask: Ground truth mask for comparison (optional)
     """
     # Denormalize image
     mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
@@ -893,9 +692,12 @@ def visualize_sam_enhanced_results(
     image_np = image.permute(1, 2, 0).cpu().numpy()
 
     # Determine number of subplots based on what's available
+    # If gt_mask is provided, show: original, gt_mask, predicted_mask (3 plots)
+    if gt_mask is not None and sam_mask is not None:
+        n_plots = 3
     # If no SAM mask, we need 3 plots: original image, heatmap, heatmap with bbox
     # If SAM mask is available, we need 4 plots: original, heatmap, SAM mask, combined
-    if sam_mask is not None:
+    elif sam_mask is not None:
         n_plots = 4
     elif anomaly_heatmap is not None:
         n_plots = 3
@@ -907,53 +709,118 @@ def visualize_sam_enhanced_results(
     if n_plots == 1:
         axes = [axes]
 
-    # Plot original image
-    axes[0].imshow(image_np)
-    axes[0].set_title('Original Image', fontsize=12)
-    axes[0].axis('off')
-
-    # Plot anomaly heatmap if available
-    if anomaly_heatmap is not None:
-        import matplotlib.patches as patches
+    # Special case: ground truth comparison mode (3 plots: image, heatmap, gt+pred overlay)
+    # Only show this for anomalous samples (when gt_mask is not None)
+    if gt_mask is not None and sam_mask is not None:
+        # Plot 1: Original image
+        axes[0].imshow(image_np)
+        axes[0].set_title('Original Image', fontsize=12)
+        axes[0].axis('off')
         
-        im1 = axes[1].imshow(anomaly_heatmap, cmap='hot', alpha=0.7)
-        axes[1].imshow(image_np, alpha=0.3)
-        # Add bounding box to heatmap
-        if bbox is not None:
-            x_min, y_min, x_max, y_max = bbox
-            rect = patches.Rectangle((x_min, y_min), x_max - x_min, y_max - y_min,
-                                    linewidth=2, edgecolor='lime', facecolor='none')
-            axes[1].add_patch(rect)
-        axes[1].set_title('Anomaly Heatmap', fontsize=12)
-        axes[1].axis('off')
-        plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
-        
-        # Plot SAM mask if available
-        if sam_mask is not None:
-            axes[2].imshow(image_np)
-            axes[2].imshow(sam_mask, alpha=0.5, cmap='Reds')
-            # Add bounding box to SAM mask
-            axes[2].set_title('SAM Segmentation', fontsize=12)
-            axes[2].axis('off')
-            
-            # Plot combined result
-            combined_mask = anomaly_heatmap * sam_mask if sam_mask is not None else anomaly_heatmap
-            axes[3].imshow(image_np)
-            axes[3].imshow(combined_mask, alpha=0.7, cmap='hot')
-            # Add bounding box to combined result
-            axes[3].set_title('SAM-Enhanced Result', fontsize=12)
-            axes[3].axis('off')
+        # Plot 2: Anomaly heatmap
+        if anomaly_heatmap is not None:
+            axes[1].imshow(image_np)
+            im = axes[1].imshow(anomaly_heatmap, alpha=0.7, cmap='hot')
+            axes[1].set_title('Anomaly Heatmap', fontsize=12)
+            axes[1].axis('off')
+            plt.colorbar(im, ax=axes[1], fraction=0.046, pad=0.04)
         else:
-            # Plot heatmap with bounding box (no SAM)
-            axes[2].imshow(image_np)
-            axes[2].imshow(anomaly_heatmap, alpha=0.7, cmap='hot')
+            axes[1].imshow(image_np)
+            axes[1].set_title('No Heatmap', fontsize=12)
+            axes[1].axis('off')
+        
+        # Plot 3: Ground truth (green) + Predicted mask (red) overlay
+        axes[2].imshow(image_np)
+        # Resize masks to match image size (important: gt masks come from original files)
+        img_h, img_w = image_np.shape[:2]
+        # Ensure gt_mask is numpy
+        if not isinstance(gt_mask, np.ndarray):
+            gt_mask_arr = np.array(gt_mask)
+        else:
+            gt_mask_arr = gt_mask
+        if not isinstance(sam_mask, np.ndarray):
+            sam_mask_arr = np.array(sam_mask)
+        else:
+            sam_mask_arr = sam_mask
+
+        # Resize with nearest neighbor to preserve binary labels
+        try:
+            if gt_mask_arr.shape[:2] != (img_h, img_w):
+                gt_resized = cv2.resize(gt_mask_arr.astype(np.uint8), (img_w, img_h), interpolation=cv2.INTER_NEAREST)
+            else:
+                gt_resized = gt_mask_arr.astype(np.uint8)
+        except Exception:
+            gt_resized = (gt_mask_arr > 0).astype(np.uint8)
+
+        try:
+            if sam_mask_arr.shape[:2] != (img_h, img_w):
+                sam_resized = cv2.resize(sam_mask_arr.astype(np.uint8), (img_w, img_h), interpolation=cv2.INTER_NEAREST)
+            else:
+                sam_resized = sam_mask_arr.astype(np.uint8)
+        except Exception:
+            sam_resized = (sam_mask_arr > 0).astype(np.uint8)
+
+        # Convert masks to float and ensure they're binary
+        gt_normalized = (gt_resized > 0).astype(np.float32)
+        sam_normalized = (sam_resized > 0).astype(np.float32)
+
+        # Show ground truth in green with higher alpha for visibility
+        axes[2].imshow(np.stack([np.zeros_like(gt_normalized), gt_normalized, np.zeros_like(gt_normalized)], axis=-1),
+                      alpha=0.5)
+        # Show predicted mask in red with higher alpha
+        axes[2].imshow(np.stack([sam_normalized, np.zeros_like(sam_normalized), np.zeros_like(sam_normalized)], axis=-1),
+                      alpha=0.5)
+        axes[2].set_title('GT (Green) + Pred (Red) Overlay', fontsize=12)
+        axes[2].axis('off')
+    else:
+        # Original visualization logic
+        # Plot original image
+        axes[0].imshow(image_np)
+        axes[0].set_title('Original Image', fontsize=12)
+        axes[0].axis('off')
+
+        # Plot anomaly heatmap if available (only in non-gt-comparison mode)
+        if anomaly_heatmap is not None:
+            import matplotlib.patches as patches
+            
+            im1 = axes[1].imshow(anomaly_heatmap, cmap='hot', alpha=0.7)
+            axes[1].imshow(image_np, alpha=0.3)
+            # Add bounding box to heatmap
             if bbox is not None:
                 x_min, y_min, x_max, y_max = bbox
                 rect = patches.Rectangle((x_min, y_min), x_max - x_min, y_max - y_min,
                                         linewidth=2, edgecolor='lime', facecolor='none')
-                axes[2].add_patch(rect)
-            axes[2].set_title('DINOv3 Anomaly Localization', fontsize=12)
-            axes[2].axis('off')
+                axes[1].add_patch(rect)
+            axes[1].set_title('Anomaly Heatmap', fontsize=12)
+            axes[1].axis('off')
+            plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+            
+            # Plot SAM mask if available
+            if sam_mask is not None:
+                axes[2].imshow(image_np)
+                axes[2].imshow(sam_mask, alpha=0.5, cmap='Reds')
+                # Add bounding box to SAM mask
+                axes[2].set_title('SAM Segmentation', fontsize=12)
+                axes[2].axis('off')
+                
+                # Plot combined result
+                combined_mask = anomaly_heatmap * sam_mask if sam_mask is not None else anomaly_heatmap
+                axes[3].imshow(image_np)
+                axes[3].imshow(combined_mask, alpha=0.7, cmap='hot')
+                # Add bounding box to combined result
+                axes[3].set_title('SAM-Enhanced Result', fontsize=12)
+                axes[3].axis('off')
+            else:
+                # Plot heatmap with bounding box (no SAM)
+                axes[2].imshow(image_np)
+                axes[2].imshow(anomaly_heatmap, alpha=0.7, cmap='hot')
+                if bbox is not None:
+                    x_min, y_min, x_max, y_max = bbox
+                    rect = patches.Rectangle((x_min, y_min), x_max - x_min, y_max - y_min,
+                                            linewidth=2, edgecolor='lime', facecolor='none')
+                    axes[2].add_patch(rect)
+                axes[2].set_title('DINOv3 Anomaly Localization', fontsize=12)
+                axes[2].axis('off')
 
     # Add overall title
     color = 'red' if label == 1 else 'green'
@@ -1021,7 +888,7 @@ def visualize_anomaly_map(
     Visualize an image with its anomaly score (legacy function).
     """
     visualize_sam_enhanced_results(
-        image, anomaly_score, None, None, label, defect_type, save_path, None
+        image, anomaly_score, None, None, label, defect_type, save_path, None, None
     )
 
 
@@ -1041,9 +908,6 @@ def run_sam_enhanced_anomaly_detection(
     few_shot_mode: bool = False,
     n_shots: int = 5,
     save_visualizations: bool = True,
-    use_mirroring: bool = False,
-    use_prompts: bool = False,
-    prompt_checkpoint: Optional[str] = None,
 ):
     """
     Run SAM-enhanced anomaly detection on MVTec AD category.
@@ -1062,32 +926,20 @@ def run_sam_enhanced_anomaly_detection(
         use_sam_for_normal_masking: Whether to use SAM for masking normal objects
         few_shot_mode: Whether to use few-shot learning
         n_shots: Number of shots for few-shot learning
-        save_visualizations: Whether to save visualizations
-        use_mirroring: Whether to use mirroring for anomaly scoring
     """
-    mode_str = "Mirroring" if use_mirroring else (f"Few-Shot ({n_shots})" if few_shot_mode else "Zero-Shot")
+    mode_str = f"Few-Shot ({n_shots} shots)" if few_shot_mode else "Zero-Shot"
     print(f"\n{'='*70}")
-    print(f"Run: {mode_str} Anomaly Detection: {category}")
+    print(f"SAM-Enhanced {mode_str} Anomaly Detection: {category}")
     print(f"{'='*70}\n")
 
     # Setup output directory - make it relative to script location
+    # Output dir is already configured by main() for multi-category runs
     script_dir = Path(__file__).parent
-    sam_suffix = "_sam" if sam_checkpoint else "_nosam"
-    if use_mirroring:
-        method_suffix = "_mirroring"
-    else:
-        method_suffix = f"_fewshot_{n_shots}" if few_shot_mode else "_zeroshot"
-    prompts_suffix = "_prompts" if use_prompts else ""
-    output_dir = script_dir / output_dir / f"{category}{sam_suffix}{method_suffix}{prompts_suffix}"
+    output_dir = script_dir / output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Initialize SAM with M2 MacBook optimization
-    if torch.backends.mps.is_available():
-        device = "mps"  # Apple Silicon GPU
-    elif torch.cuda.is_available():
-        device = "cuda"
-    else:
-        device = "cpu"
+    # Initialize SAM
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     sam_integrator = SAMIntegrator(sam_checkpoint, model_type=sam_model_type, device=device)
 
     # Initialize DINOv3 model
@@ -1096,47 +948,6 @@ def run_sam_enhanced_anomaly_detection(
         model_name=model_name,
         use_huggingface=True,
     )
-
-    # Load prompt tuning if requested
-    prompt_model = None
-    if use_prompts:
-        if not PROMPTS_AVAILABLE:
-            print("Error: Prompt tuning requested but prompt_model not available")
-            print("Make sure prompt_based_feature_adaption module is accessible")
-            return
-
-        if not prompt_checkpoint:
-            print("Error: --use-prompts requires --prompt-checkpoint to be specified")
-            return
-
-        if not Path(prompt_checkpoint).exists():
-            print(f"Error: Prompt checkpoint not found: {prompt_checkpoint}")
-            return
-
-        print(f"Loading prompt checkpoint from {prompt_checkpoint}...")
-        checkpoint = torch.load(prompt_checkpoint, map_location='cpu', weights_only=False)
-
-        # Extract prompt configuration from checkpoint
-        num_prompts = checkpoint.get('num_prompts', 10)
-        embed_dim = checkpoint['prompts'].shape[1]
-
-        # Wrap extractor model with VisualPromptTuning
-        prompt_model = VisualPromptTuning(
-            dinov3_model=extractor.model,
-            num_prompts=num_prompts,
-            embed_dim=embed_dim,
-        )
-
-        # Load trained prompts
-        prompt_model.prompts.data = checkpoint['prompts']
-        prompt_model.eval()
-
-        # Attach prompt model to extractor (don't replace the model itself)
-        extractor.prompt_model = prompt_model
-
-        print(f"✓ Loaded {num_prompts} prompt tokens (dim={embed_dim})")
-        print(f"  Category: {checkpoint.get('category', 'unknown')}")
-        print(f"  Original model: {checkpoint.get('model_name', 'unknown')}")
 
     # Setup transforms
     transform = get_mvtec_transforms(image_size)
@@ -1149,227 +960,138 @@ def run_sam_enhanced_anomaly_detection(
         split='train',
         transform=transform,
     )
-    train_loader = DataLoader(
-        full_train_dataset, 
-        batch_size=batch_size, 
-        shuffle=False, 
-        collate_fn=custom_collate_fn,
-    )
-    print(f"\nLoading test data...")
-    test_dataset = MVTecADDataset(root=root_dir, category=category, split='test', transform=transform)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=custom_collate_fn)
     
-    # Initialize variables that may be set differently based on mirroring
-    patch_level_scores = None
-    
-    # Apply Mirroring strategy if enabled
-    if use_mirroring:
-        print("Using Mirroring DINO strategy...")
-        # Initialize Detector (Patch size 14 for ViT-S/14, 16 for others. Adjust if needed)
-        p_size = 14 if 'vits14' in model_name or 'dinov2' in model_name else 16
-        if 'dinov3' in model_name: p_size = 14  # DINOv3 uses 14
-        
-        mirroring_detector = MirroringAnomalyDetector(extractor, image_size=image_size, patch_size=p_size)
-        
-        # "Train" (Estimate Baseline)
-        mirroring_detector.fit(train_loader)
-        
-        # Predict
-        anomaly_scores, patch_level_scores, labels_np = mirroring_detector.predict(test_loader)
-        test_labels = labels_np
-        
-        # Create test_embeddings dict for compatibility with evaluation code
-        test_embeddings = {'labels': labels_np}
-        
-        # Set dictionaries for compatibility with evaluation code below
-        anomaly_scores_cosine = anomaly_scores
-        anomaly_scores_euclidean = anomaly_scores # Placeholder
-        anomaly_scores_knn = anomaly_scores # Placeholder
-        k_cosine = 1
-        k_euclidean = 1
-        k_knn = 1
-        
-    else:
-        # Regular (non-mirroring) processing logic
-        
-        # Apply few-shot sampling if needed
-        if few_shot_mode and n_shots > 0:
-            from torch.utils.data import Subset
-            import random
-            normal_indices = full_train_dataset.get_normal_samples()
-            if len(normal_indices) > n_shots:
-                random.seed(42)
-                selected_indices = random.sample(normal_indices, n_shots)
-                train_dataset = Subset(full_train_dataset, selected_indices)
-            else:
-                train_dataset = full_train_dataset
-            print(f"Few-shot training samples: {len(train_dataset)}")
+    # Apply few-shot sampling if needed
+    if few_shot_mode and n_shots > 0:
+        from torch.utils.data import Subset
+        import random
+        normal_indices = full_train_dataset.get_normal_samples()
+        if len(normal_indices) > n_shots:
+            random.seed(42)
+            selected_indices = random.sample(normal_indices, n_shots)
+            train_dataset = Subset(full_train_dataset, selected_indices)
         else:
-            # Zero-shot (n_shots=0) or regular mode: use all training samples
             train_dataset = full_train_dataset
-            if few_shot_mode and n_shots == 0:
-                print(f"Zero-shot mode: using all {len(train_dataset)} training samples")
-            else:
-                print(f"Training samples: {len(train_dataset)}")
-        
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, collate_fn=custom_collate_fn)
-
-        # SAM-Enhanced Normal Prototype Creation
-        if use_sam_for_normal_masking and sam_integrator.sam_available:
-            print("Creating SAM-enhanced normal prototypes...")
-            normal_images = []
-            for i in range(min(len(train_dataset), 10)):  # Use first 10 samples for SAM masking
-                sample = train_dataset[i] if hasattr(train_dataset, '__getitem__') else full_train_dataset[train_dataset.indices[i]]
-                # Convert tensor to numpy for SAM
-                img_tensor = sample['image']
-                # Denormalize
-                mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-                std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-                img_denorm = img_tensor * std + mean
-                img_np = (img_denorm.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-                normal_images.append(img_np)
-            
-            # Get SAM masks for normal objects
-            normal_masks = sam_integrator.segment_normal_objects(normal_images)
-            print(f"Generated {len(normal_masks)} SAM masks for normal objects")
-
-        # Extract training embeddings
-        train_embeddings = extractor.extract_embeddings_batch(
-            train_loader,
-            extract_patches=use_patches,
-            extract_cls=True,
-        )
-
-        # Get normal embeddings for reference
-        if use_patches:
-            normal_embeddings = train_embeddings['patch_embeddings']
+        print(f"Few-shot training samples: {len(train_dataset)}")
+    else:
+        # Zero-shot (n_shots=0) or regular mode: use all training samples
+        train_dataset = full_train_dataset
+        if few_shot_mode and n_shots == 0:
+            print(f"Zero-shot mode: using all {len(train_dataset)} training samples")
         else:
-            normal_embeddings = train_embeddings['cls_embeddings']
+            print(f"Training samples: {len(train_dataset)}")
+    
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, collate_fn=custom_collate_fn)
 
-        print(f"Normal embeddings shape: {normal_embeddings.shape}")
+    # SAM-Enhanced Normal Prototype Creation
+    if use_sam_for_normal_masking and sam_integrator.sam_available:
+        print("Creating SAM-enhanced normal prototypes...")
+        normal_images = []
+        for i in range(min(len(train_dataset), 10)):  # Use first 10 samples for SAM masking
+            sample = train_dataset[i] if hasattr(train_dataset, '__getitem__') else full_train_dataset[train_dataset.indices[i]]
+            # Convert tensor to numpy for SAM
+            img_tensor = sample['image']
+            # Denormalize
+            mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+            std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+            img_denorm = img_tensor * std + mean
+            img_np = (img_denorm.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+            normal_images.append(img_np)
+        
+        # Get SAM masks for normal objects
+        normal_masks = sam_integrator.segment_normal_objects(normal_images)
+        print(f"Generated {len(normal_masks)} SAM masks for normal objects")
 
-        # Load test data
-        print(f"\nLoading test data...")
-        test_dataset = MVTecADDataset(
-            root=root_dir,
-            category=category,
-            split='test',
-            transform=transform,
-        )
-        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=custom_collate_fn)
+    # Extract training embeddings
+    train_embeddings = extractor.extract_embeddings_batch(
+        train_loader,
+        extract_patches=use_patches,
+        extract_cls=True,
+    )
 
-        # Extract test embeddings
-        print(f"Test samples: {len(test_dataset)}")
-        test_embeddings = extractor.extract_embeddings_batch(
-            test_loader,
-            extract_patches=use_patches,
-            extract_cls=True,
-        )
+    # Get normal embeddings for reference
+    if use_patches:
+        normal_embeddings = train_embeddings['patch_embeddings']
+    else:
+        normal_embeddings = train_embeddings['cls_embeddings']
 
-        if use_patches:
-            test_embed = test_embeddings['patch_embeddings']
+    print(f"Normal embeddings shape: {normal_embeddings.shape}")
+
+    # Load test data
+    print(f"\nLoading test data...")
+    test_dataset = MVTecADDataset(
+        root=root_dir,
+        category=category,
+        split='test',
+        transform=transform,
+    )
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=custom_collate_fn)
+
+    # Extract test embeddings
+    print(f"Test samples: {len(test_dataset)}")
+    test_embeddings = extractor.extract_embeddings_batch(
+        test_loader,
+        extract_patches=use_patches,
+        extract_cls=True,
+    )
+
+    if use_patches:
+        test_embed = test_embeddings['patch_embeddings']
+    else:
+        test_embed = test_embeddings['cls_embeddings']
+
+    print(f"Test embeddings shape: {test_embed.shape}")
+
+    # Compute anomaly scores for all metrics
+    print(f"\nComputing anomaly scores for all metrics...")
+    
+    # Check if zero-shot mode (no few-shot flag or n_shots not provided)
+    is_zeroshot = not few_shot_mode
+    
+    # Determine k values for each metric
+    k_cosine = k_neighbors
+    k_euclidean = 1  # Use nearest neighbor for euclidean
+    k_knn = k_neighbors  # Use k-NN with k neighbors
+    
+    if use_patches:
+        if is_zeroshot:
+            # TRUE ZERO-SHOT: Use self-similarity (no reference to training data)
+            print(f"Using TRUE ZERO-SHOT mode (patch self-similarity)...")
+            
+            # For image-level scores, use mean of patch self-similarity scores
+            print(f"Computing zero-shot patch self-similarity scores...")
+            
+            # Get image paths for saving heatmaps
+            image_paths = [test_dataset[i]['image_path'] for i in range(len(test_dataset))]
+            
+            # Get images and labels for visualization
+            test_images = [test_dataset[i]['image'] for i in range(len(test_dataset))]
+            test_labels = test_embeddings['labels']
+            
+            # Compute zero-shot heatmaps and save them
+            zeroshot_heatmap_dir = output_dir / "zeroshot_heatmaps"
+            patch_level_scores = compute_patch_anomaly_scores_zeroshot(
+                test_embed,
+                metric='cosine',
+                save_dir=zeroshot_heatmap_dir if save_visualizations else None,
+                image_paths=image_paths,
+                image_size=image_size,
+                images=test_images if save_visualizations else None,
+                labels=test_labels,
+            )
+            
+            # Image-level anomaly score = mean of patch anomaly scores
+            anomaly_scores_cosine = patch_level_scores.mean(axis=1)
+            anomaly_scores_euclidean = anomaly_scores_cosine.copy()  # Same for zero-shot
+            anomaly_scores_knn = anomaly_scores_cosine.copy()  # Same for zero-shot
+            
+            print(f"Zero-shot patch-level scores shape: {patch_level_scores.shape}")
+            print(f"Zero-shot image-level scores shape: {anomaly_scores_cosine.shape}")
         else:
-            test_embed = test_embeddings['cls_embeddings']
-
-        print(f"Test embeddings shape: {test_embed.shape}")
-
-        # Compute anomaly scores for all metrics
-        print(f"\nComputing anomaly scores for all metrics...")
-        
-        # Check if zero-shot mode (no few-shot flag or n_shots not provided)
-        is_zeroshot = not few_shot_mode
-        
-        # Determine k values for each metric
-        k_cosine = k_neighbors
-        k_euclidean = 1  # Use nearest neighbor for euclidean
-        k_knn = k_neighbors  # Use k-NN with k neighbors
-        
-        if use_patches:
-            if is_zeroshot:
-                # TRUE ZERO-SHOT: Use self-similarity (no reference to training data)
-                print(f"Using TRUE ZERO-SHOT mode (patch self-similarity)...")
-                
-                # For image-level scores, use mean of patch self-similarity scores
-                print(f"Computing zero-shot patch self-similarity scores...")
-                
-                # Get image paths for saving heatmaps
-                image_paths = [test_dataset[i]['image_path'] for i in range(len(test_dataset))]
-                
-                # Get images and labels for visualization
-                test_images = [test_dataset[i]['image'] for i in range(len(test_dataset))]
-                test_labels = test_embeddings['labels']
-                
-                # Compute zero-shot heatmaps and save them
-                zeroshot_heatmap_dir = output_dir / "zeroshot_heatmaps"
-                patch_level_scores = compute_patch_anomaly_scores_zeroshot(
-                    test_embed,
-                    metric='cosine',
-                    save_dir=zeroshot_heatmap_dir if save_visualizations else None,
-                    image_paths=image_paths,
-                    image_size=image_size,
-                    images=test_images if save_visualizations else None,
-                    labels=test_labels,
-                )
-                
-                # Image-level anomaly score = mean of patch anomaly scores
-                anomaly_scores_cosine = patch_level_scores.mean(axis=1)
-                anomaly_scores_euclidean = anomaly_scores_cosine.copy()  # Same for zero-shot
-                anomaly_scores_knn = anomaly_scores_cosine.copy()  # Same for zero-shot
-                
-                print(f"Zero-shot patch-level scores shape: {patch_level_scores.shape}")
-                print(f"Zero-shot image-level scores shape: {anomaly_scores_cosine.shape}")
-            else:
-                # FEW-SHOT: Compare against training samples
-                print(f"Using FEW-SHOT mode ({n_shots} shots)...")
-                
-                # Cosine similarity
-                print(f"  Cosine similarity (k={k_cosine})...")
-                anomaly_scores_cosine = compute_anomaly_scores(
-                    test_embed,
-                    normal_embeddings,
-                    metric='cosine',
-                    k=k_cosine,
-                )
-                
-                # Euclidean distance
-                print(f"  Euclidean distance (k={k_euclidean})...")
-                anomaly_scores_euclidean = compute_anomaly_scores(
-                    test_embed,
-                    normal_embeddings,
-                    metric='euclidean',
-                    k=k_euclidean,
-                )
-                
-                # k-NN distance
-                print(f"  k-NN distance (k={k_knn})...")
-                anomaly_scores_knn = compute_anomaly_scores(
-                    test_embed,
-                    normal_embeddings,
-                    metric='knn',
-                    k=k_knn,
-                )
-                
-                # Compute patch-level scores for heatmap visualization (using cosine)
-                if test_embed.ndim == 3:  # (N, P, D) format
-                    print(f"Computing patch-level scores for heatmaps...")
-                    patch_level_scores = compute_patch_anomaly_scores(
-                        test_embed,
-                        normal_embeddings,
-                        metric='cosine',
-                    )
-                    print(f"Patch-level scores shape: {patch_level_scores.shape}")
-                else:
-                    patch_level_scores = None
+            # FEW-SHOT: Compare against training samples
+            print(f"Using FEW-SHOT mode ({n_shots} shots)...")
             
-            # Use cosine as primary metric (backward compatibility)
-            anomaly_scores = anomaly_scores_cosine
-            print(f"Image-level anomaly scores shape: {anomaly_scores.shape}")
-            
-        else:
-            # CLS token anomaly detection - always use few-shot approach
-            if is_zeroshot:
-                print("Warning: CLS token mode does not support true zero-shot. Using all training samples.")
-            
+            # Cosine similarity
             print(f"  Cosine similarity (k={k_cosine})...")
             anomaly_scores_cosine = compute_anomaly_scores(
                 test_embed,
@@ -1378,6 +1100,7 @@ def run_sam_enhanced_anomaly_detection(
                 k=k_cosine,
             )
             
+            # Euclidean distance
             print(f"  Euclidean distance (k={k_euclidean})...")
             anomaly_scores_euclidean = compute_anomaly_scores(
                 test_embed,
@@ -1395,9 +1118,55 @@ def run_sam_enhanced_anomaly_detection(
                 k=k_knn,
             )
             
-            # Use cosine as primary metric
-            anomaly_scores = anomaly_scores_cosine
-            patch_level_scores = None
+            # Compute patch-level scores for heatmap visualization (using cosine)
+            if test_embed.ndim == 3:  # (N, P, D) format
+                print(f"Computing patch-level scores for heatmaps...")
+                patch_level_scores = compute_patch_anomaly_scores(
+                    test_embed,
+                    normal_embeddings,
+                    metric='cosine',
+                )
+                print(f"Patch-level scores shape: {patch_level_scores.shape}")
+            else:
+                patch_level_scores = None
+        
+        # Use cosine as primary metric (backward compatibility)
+        anomaly_scores = anomaly_scores_cosine
+        print(f"Image-level anomaly scores shape: {anomaly_scores.shape}")
+        
+    else:
+        # CLS token anomaly detection - always use few-shot approach
+        if is_zeroshot:
+            print("Warning: CLS token mode does not support true zero-shot. Using all training samples.")
+        
+        print(f"  Cosine similarity (k={k_cosine})...")
+        anomaly_scores_cosine = compute_anomaly_scores(
+            test_embed,
+            normal_embeddings,
+            metric='cosine',
+            k=k_cosine,
+        )
+        
+        print(f"  Euclidean distance (k={k_euclidean})...")
+        anomaly_scores_euclidean = compute_anomaly_scores(
+            test_embed,
+            normal_embeddings,
+            metric='euclidean',
+            k=k_euclidean,
+        )
+        
+        # k-NN distance
+        print(f"  k-NN distance (k={k_knn})...")
+        anomaly_scores_knn = compute_anomaly_scores(
+            test_embed,
+            normal_embeddings,
+            metric='knn',
+            k=k_knn,
+        )
+        
+        # Use cosine as primary metric
+        anomaly_scores = anomaly_scores_cosine
+        patch_level_scores = None
 
     print(f"Computed anomaly scores for {len(anomaly_scores)} test images")
 
@@ -1421,11 +1190,18 @@ def run_sam_enhanced_anomaly_detection(
         
         # Apply SAM post-processing if available
         if sam_integrator.sam_available:
-            print("Applying SAM post-processing...")
+            print("Applying SAM post-processing (anomalous samples only)...")
             
             for i in range(len(anomaly_scores)):
                 # Get test image
                 sample = test_dataset[i]
+                
+                # Only apply SAM to anomalous samples (label=1)
+                # Skip normal samples (label=0 or defect_type='good')
+                if sample['label'] == 0 or sample['defect_type'] == 'good':
+                    sam_masks.append(None)
+                    continue
+                
                 img_tensor = sample['image']
                 
                 # Convert to numpy for SAM
@@ -1438,11 +1214,45 @@ def run_sam_enhanced_anomaly_detection(
                 sam_mask = sam_integrator.predict_mask_from_bbox(img_np, bboxes[i], anomaly_heatmaps[i])
                 sam_masks.append(sam_mask)
                 
-            print(f"Generated {len(sam_masks)} SAM masks")
+            num_sam_masks = sum(1 for m in sam_masks if m is not None)
+            print(f"Generated {num_sam_masks} SAM masks for anomalous samples")
         else:
             print("SAM not available - heatmaps generated with bounding boxes")
     elif not save_visualizations:
         print("Skipping heatmap generation (--save-visualizations not enabled)")
+    
+    # Evaluate SAM masks against ground truth if --use-sam-masking is enabled
+    mask_metrics = None
+    gt_masks = []
+    if use_sam_for_normal_masking and sam_integrator.sam_available and len(sam_masks) > 0:
+        print(f"\nLoading ground truth masks for mask evaluation...")
+        
+        # Load ground truth masks for all test images
+        for i in range(len(test_dataset)):
+            sample = test_dataset[i]
+            gt_mask = load_ground_truth_mask(sample['image_path'], root_dir, category)
+            gt_masks.append(gt_mask)
+        
+        print(f"Loaded {sum(1 for m in gt_masks if m is not None)} ground truth masks")
+        
+        # Evaluate SAM masks against ground truth
+        print(f"Evaluating SAM mask quality (anomalous samples only)...")
+        mask_metrics = evaluate_mask_segmentation(sam_masks, gt_masks)
+        
+        print(f"\nMask Segmentation Metrics (Anomalous Samples Only):")
+        print(f"  Pixel Precision: {mask_metrics['pixel_precision']:.4f}")
+        print(f"  Pixel Recall: {mask_metrics['pixel_recall']:.4f}")
+        print(f"  Dice Coefficient: {mask_metrics['dice_coefficient']:.4f}")
+        print(f"  Pixel Accuracy: {mask_metrics['pixel_accuracy']:.4f}")
+        print(f"  IoU: {mask_metrics['iou']:.4f}")
+        print(f"  Number of anomalous samples: {mask_metrics['num_anomalous_samples']}")
+        print(f"  Number of pixels evaluated: {mask_metrics['num_evaluated_pixels']}")
+        
+        # Save mask metrics to file
+        mask_metrics_file = output_dir / "mask_segmentation_metrics.json"
+        with open(mask_metrics_file, 'w') as f:
+            json.dump(mask_metrics, f, indent=2)
+        print(f"Saved mask segmentation metrics to {mask_metrics_file}")
     
     # Evaluate all metrics
     print(f"\nEvaluating metrics...")
@@ -1464,12 +1274,21 @@ def run_sam_enhanced_anomaly_detection(
     print(f"\n  Cosine Similarity (k={k_cosine}):")
     print(f"    AUROC: {metrics_cosine['auroc']:.4f}")
     print(f"    Average Precision: {metrics_cosine['average_precision']:.4f}")
+    print(f"    Precision: {metrics_cosine['precision']:.4f}")
+    print(f"    Recall: {metrics_cosine['recall']:.4f}")
+    print(f"    F1 Score: {metrics_cosine['f1_score']:.4f}")
     print(f"\n  Euclidean Distance (k={k_euclidean}):")
     print(f"    AUROC: {metrics_euclidean['auroc']:.4f}")
     print(f"    Average Precision: {metrics_euclidean['average_precision']:.4f}")
+    print(f"    Precision: {metrics_euclidean['precision']:.4f}")
+    print(f"    Recall: {metrics_euclidean['recall']:.4f}")
+    print(f"    F1 Score: {metrics_euclidean['f1_score']:.4f}")
     print(f"\n  k-NN Distance (k={k_knn}):")
     print(f"    AUROC: {metrics_knn['auroc']:.4f}")
     print(f"    Average Precision: {metrics_knn['average_precision']:.4f}")
+    print(f"    Precision: {metrics_knn['precision']:.4f}")
+    print(f"    Recall: {metrics_knn['recall']:.4f}")
+    print(f"    F1 Score: {metrics_knn['f1_score']:.4f}")
     print(f"{'='*70}\n")
 
     # Save metrics
@@ -1477,32 +1296,6 @@ def run_sam_enhanced_anomaly_detection(
     with open(metrics_file, 'w') as f:
         json.dump(metrics, f, indent=2)
     print(f"Saved metrics to {metrics_file}")
-    
-    # Create and save confusion matrix visualizations
-    if save_visualizations:
-        cm_dir = output_dir / "confusion_matrices"
-        cm_dir.mkdir(exist_ok=True)
-        
-        for metric_name, metric_data in metrics.items():
-            if metric_name != 'primary_metric' and 'confusion_matrix' in metric_data:
-                cm = metric_data['confusion_matrix']
-                
-                # Regular confusion matrix
-                cm_path = cm_dir / f"confusion_matrix_{metric_name}.png"
-                plot_confusion_matrix(
-                    cm, 
-                    cm_path, 
-                    title=f"Confusion Matrix - {metric_name.title()} Metric"
-                )
-                
-                # Normalized confusion matrix
-                cm_norm_path = cm_dir / f"confusion_matrix_{metric_name}_normalized.png"
-                plot_confusion_matrix(
-                    cm, 
-                    cm_norm_path, 
-                    title=f"Confusion Matrix - {metric_name.title()} Metric",
-                    normalize=True
-                )
 
     # Visualize samples
     if save_visualizations and visualize_samples > 0:
@@ -1527,6 +1320,8 @@ def run_sam_enhanced_anomaly_detection(
             heatmap = anomaly_heatmaps[idx] if idx < len(anomaly_heatmaps) else None
             sam_mask_data = sam_masks[idx] if idx < len(sam_masks) else None
             bbox_data = bboxes[idx] if idx < len(bboxes) else None
+            # Only pass ground truth for anomalous samples (when --use-sam-masking is on)
+            gt_mask_data = gt_masks[idx] if (idx < len(gt_masks) and use_sam_for_normal_masking) else None
             
             # Save SAM mask as .npy file if available
             if sam_mask_data is not None:
@@ -1542,6 +1337,7 @@ def run_sam_enhanced_anomaly_detection(
                 sample['defect_type'],
                 save_path,
                 bbox_data,
+                gt_mask_data,
             )
 
         # Visualize top normal samples
@@ -1560,6 +1356,8 @@ def run_sam_enhanced_anomaly_detection(
             heatmap = anomaly_heatmaps[idx] if idx < len(anomaly_heatmaps) else None
             sam_mask_data = sam_masks[idx] if idx < len(sam_masks) else None
             bbox_data = bboxes[idx] if idx < len(bboxes) else None
+            # Don't pass ground truth for normal samples - they don't have ground truth masks
+            gt_mask_data = None
             
             # Save SAM mask as .npy file if available
             if sam_mask_data is not None:
@@ -1575,6 +1373,7 @@ def run_sam_enhanced_anomaly_detection(
                 sample['defect_type'],
                 save_path,
                 bbox_data,
+                gt_mask_data,
             )
 
     # Save anomaly scores for all metrics
@@ -1613,7 +1412,7 @@ def main():
     parser.add_argument(
         "--root-dir",
         type=str,
-        default=str(Path(__file__).parent.parent.parent / "mvtec_ad"),
+        default=str(Path(__file__).parent.parent / "mvtec_ad"),
         help="Root directory of MVTec AD dataset"
     )
     parser.add_argument(
@@ -1664,6 +1463,7 @@ def main():
     parser.add_argument(
         "--save-visualizations",
         action="store_true",
+        default=False,
         help="Enable saving visualizations (heatmaps will only be computed if this is set)"
     )
     parser.add_argument(
@@ -1699,22 +1499,6 @@ def main():
         default=None,
         help="Array of shot values to test, e.g., '1,3,5,10' (overrides --n-shots)"
     )
-    parser.add_argument(
-        "--use-mirroring", 
-        action="store_true", 
-        help="Enable Mirroring DINO strategy (Compare image vs flipped)"
-    )
-    parser.add_argument(
-        "--use-prompts",
-        action="store_true",
-        help="Enable prompt-based feature adaptation"
-    )
-    parser.add_argument(
-        "--prompt-checkpoint",
-        type=str,
-        default=None,
-        help="Path to trained prompt checkpoint (e.g., checkpoints/screw_prompts.pt)"
-    )
 
     args = parser.parse_args()
 
@@ -1737,18 +1521,9 @@ def main():
     if args.use_sam:
         # Auto-detect SAM checkpoint if not provided
         if args.sam_checkpoint is None:
-            # Check in sam_models directory first, then script directory
-            root_dir = Path(__file__).parent.parent.parent
-            sam_models_dir = root_dir / "sam_models"
             script_dir = Path(__file__).parent
-            
             # Check for SAM checkpoints in order of preference (largest/best first)
             sam_checkpoints = [
-                # First check sam_models directory
-                sam_models_dir / "sam_vit_h_4b8939.pth",
-                sam_models_dir / "sam_vit_l_0b3195.pth",
-                sam_models_dir / "sam_vit_b_01ec64.pth",
-                # Then check script directory
                 script_dir / "sam_vit_h_4b8939.pth",
                 script_dir / "sam_vit_l_0b3195.pth",
                 script_dir / "sam_vit_b_01ec64.pth",
@@ -1792,6 +1567,14 @@ def main():
         ]
     else:
         categories = args.category
+    
+    # Create folder name from categories
+    if 'all' in args.category:
+        category_folder_name = 'all_categories'
+    elif len(categories) == 1:
+        category_folder_name = categories[0]
+    else:
+        category_folder_name = '_'.join(sorted(categories))
 
     # Multi-shot experiment mode
     if shots_to_test and len(shots_to_test) > 1:
@@ -1837,8 +1620,6 @@ def main():
                         output_dir=multi_shot_output,
                         visualize_samples=args.visualize_samples,
                         sam_checkpoint=args.sam_checkpoint,
-                        use_prompts=args.use_prompts,
-                        prompt_checkpoint=args.prompt_checkpoint,
                         sam_model_type=sam_model_type if args.sam_checkpoint else "vit_l",
                         use_sam_for_normal_masking=args.use_sam_masking,
                         few_shot_mode=True,
@@ -1882,9 +1663,19 @@ def main():
         # Single shot value mode (original behavior)
         n_shots_value = shots_to_test[0] if shots_to_test else args.n_shots
         all_metrics = {}
+        
+        # Create single output folder for all categories
+        script_dir = Path(__file__).parent
+        sam_suffix = "_sam" if args.sam_checkpoint else "_nosam"
+        shots_suffix = f"_fewshot_{n_shots_value}" if args.few_shot else "_zeroshot"
+        single_output_dir = script_dir / args.output_dir / f"{category_folder_name}{sam_suffix}{shots_suffix}"
+        single_output_dir.mkdir(parents=True, exist_ok=True)
 
         for category in categories:
             try:
+                # Create category subdirectory within the main output folder
+                category_output_dir = str(single_output_dir / category)
+                
                 metrics = run_sam_enhanced_anomaly_detection(
                     category=category,
                     root_dir=args.root_dir,
@@ -1893,7 +1684,7 @@ def main():
                     image_size=args.image_size,
                     use_patches=not args.use_cls,
                     k_neighbors=args.k_neighbors,
-                    output_dir=args.output_dir,
+                    output_dir=category_output_dir,
                     visualize_samples=args.visualize_samples,
                     sam_checkpoint=args.sam_checkpoint,
                     sam_model_type=sam_model_type if args.sam_checkpoint else "vit_l",
@@ -1901,9 +1692,6 @@ def main():
                     few_shot_mode=args.few_shot,
                     n_shots=n_shots_value,
                     save_visualizations=args.save_visualizations,
-                    use_mirroring=args.use_mirroring,
-                    use_prompts=args.use_prompts,
-                    prompt_checkpoint=args.prompt_checkpoint,
                 )
                 all_metrics[category] = metrics
             except Exception as e:
@@ -1912,26 +1700,48 @@ def main():
 
         # Print summary if multiple categories
         if len(categories) > 1:
-            print(f"\n{'='*70}")
-            print("Summary of Results:")
-            print(f"{'='*70}")
-            print(f"{'Category':<15} {'AUROC':<10} {'AP':<10}")
-            print(f"{'-'*70}")
+            print(f"\n{'='*100}")
+            print("Summary of Results (Cosine Similarity):")
+            print(f"{'='*100}")
+            print(f"{'Category':<15} {'AUROC':<12} {'Precision':<12} {'Recall':<12} {'F1 Score':<12} {'Avg Prec':<12}")
+            print(f"{'-'*100}")
             for category, metrics in all_metrics.items():
-                print(f"{category:<15} {metrics['cosine']['auroc']:<10.4f} {metrics['cosine']['average_precision']:<10.4f}")
+                m = metrics['cosine']
+                print(f"{category:<15} {m['auroc']:<12.4f} {m['precision']:<12.4f} {m['recall']:<12.4f} {m['f1_score']:<12.4f} {m['average_precision']:<12.4f}")
 
-            # Compute average
+            # Compute averages
             avg_auroc = np.mean([m['cosine']['auroc'] for m in all_metrics.values()])
+            avg_precision = np.mean([m['cosine']['precision'] for m in all_metrics.values()])
+            avg_recall = np.mean([m['cosine']['recall'] for m in all_metrics.values()])
+            avg_f1 = np.mean([m['cosine']['f1_score'] for m in all_metrics.values()])
             avg_ap = np.mean([m['cosine']['average_precision'] for m in all_metrics.values()])
-            print(f"{'-'*70}")
-            print(f"{'Average':<15} {avg_auroc:<10.4f} {avg_ap:<10.4f}")
-            print(f"{'='*70}\n")
+            print(f"{'-'*100}")
+            print(f"{'MEAN':<15} {avg_auroc:<12.4f} {avg_precision:<12.4f} {avg_recall:<12.4f} {avg_f1:<12.4f} {avg_ap:<12.4f}")
+            print(f"{'='*100}\n")
 
-            # Save summary
-            summary_file = Path(__file__).parent / "summary.json"
+            # Save summary in the output folder
+            summary_file = single_output_dir / "summary.json"
             with open(summary_file, 'w') as f:
                 json.dump(all_metrics, f, indent=2)
             print(f"Saved summary to {summary_file}")
+            
+            # Save metrics to CSV for easy analysis
+            metrics_csv_file = single_output_dir / "metrics_summary.csv"
+            with open(metrics_csv_file, 'w') as f:
+                f.write("Category,Metric,AUROC,Precision,Recall,F1_Score,Average_Precision\n")
+                for category, metrics in all_metrics.items():
+                    for metric_name in ['cosine', 'euclidean', 'knn']:
+                        m = metrics[metric_name]
+                        f.write(f"{category},{metric_name},{m['auroc']:.4f},{m['precision']:.4f},{m['recall']:.4f},{m['f1_score']:.4f},{m['average_precision']:.4f}\n")
+                # Write averages
+                for metric_name in ['cosine', 'euclidean', 'knn']:
+                    avg_auroc = np.mean([m[metric_name]['auroc'] for m in all_metrics.values()])
+                    avg_precision = np.mean([m[metric_name]['precision'] for m in all_metrics.values()])
+                    avg_recall = np.mean([m[metric_name]['recall'] for m in all_metrics.values()])
+                    avg_f1 = np.mean([m[metric_name]['f1_score'] for m in all_metrics.values()])
+                    avg_ap = np.mean([m[metric_name]['average_precision'] for m in all_metrics.values()])
+                    f.write(f"MEAN,{metric_name},{avg_auroc:.4f},{avg_precision:.4f},{avg_recall:.4f},{avg_f1:.4f},{avg_ap:.4f}\n")
+            print(f"Saved metrics CSV to {metrics_csv_file}")
 
 
 if __name__ == "__main__":

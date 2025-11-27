@@ -14,6 +14,7 @@ def compare_sam_mask_with_groundtruth(
     sam_mask: np.ndarray,
     groundtruth_mask_path: str,
     image: np.ndarray,
+    heatmap: np.ndarray = None,
     save_path: str = None,
     title: str = "SAM vs Ground Truth Comparison"
 ):
@@ -24,6 +25,7 @@ def compare_sam_mask_with_groundtruth(
         sam_mask: Binary mask predicted by SAM (H, W) - boolean or 0/1 values
         groundtruth_mask_path: Path to ground truth mask PNG file
         image: Original RGB image (H, W, 3) - values in range [0, 255] or [0, 1]
+        heatmap: Anomaly heatmap (H, W) - optional, will be displayed in middle panel
         save_path: Path to save the comparison plot (if None, displays instead)
         title: Title for the plot
     
@@ -80,67 +82,56 @@ def compare_sam_mask_with_groundtruth(
     # Dice Coefficient
     dice = 2 * intersection / (np.sum(sam_mask_binary) + np.sum(gt_mask_binary)) if (np.sum(sam_mask_binary) + np.sum(gt_mask_binary)) > 0 else 0
     
-    # Create visualization
-    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    # Create visualization - 1 row, 3 columns
+    fig, axes = plt.subplots(1, 3, figsize=(20, 6))
     
-    # Original image
-    axes[0, 0].imshow(image)
-    axes[0, 0].set_title('Original Image', fontsize=12, fontweight='bold')
-    axes[0, 0].axis('off')
+    # Left: Original image
+    axes[0].imshow(image)
+    axes[0].set_title('Original Image', fontsize=14, fontweight='bold')
+    axes[0].axis('off')
     
-    # Ground truth mask
-    axes[0, 1].imshow(image)
-    axes[0, 1].imshow(gt_mask_binary, alpha=0.5, cmap='Reds')
-    axes[0, 1].set_title('Ground Truth Mask', fontsize=12, fontweight='bold')
-    axes[0, 1].axis('off')
+    # Middle: Anomaly Heatmap (if provided) or Ground Truth
+    if heatmap is not None:
+        # Handle PNG heatmap (BGR/RGB) - convert to RGB if needed
+        if len(heatmap.shape) == 3:
+            heatmap_resized = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
+        else:
+            heatmap_resized = heatmap
+        
+        # Resize heatmap to match image if needed
+        if heatmap_resized.shape[:2] != image.shape[:2]:
+            heatmap_resized = cv2.resize(heatmap_resized, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_LINEAR)
+        
+        axes[1].imshow(heatmap_resized)
+        axes[1].set_title('Anomaly Heatmap (No SAM)', fontsize=14, fontweight='bold')
+        axes[1].axis('off')
+    else:
+        # Fallback: show ground truth if no heatmap provided
+        axes[1].imshow(image)
+        axes[1].imshow(gt_mask_binary, alpha=0.5, cmap='Reds')
+        axes[1].set_title('Ground Truth Mask', fontsize=14, fontweight='bold')
+        axes[1].axis('off')
     
-    # SAM predicted mask
-    axes[0, 2].imshow(image)
-    axes[0, 2].imshow(sam_mask_binary, alpha=0.5, cmap='Blues')
-    axes[0, 2].set_title('SAM Predicted Mask', fontsize=12, fontweight='bold')
-    axes[0, 2].axis('off')
-    
-    # Overlay comparison
-    axes[1, 0].imshow(image)
-    # Green for correct predictions, Red for GT only, Blue for SAM only
+    # Right: SAM vs Ground Truth Overlay
+    axes[2].imshow(image)
+    # Create overlay: Green for TP, Red for FN, Blue for FP
     overlay = np.zeros((*gt_mask_binary.shape, 3), dtype=np.uint8)
-    overlay[tp_mask := ((sam_mask_binary == 1) & (gt_mask_binary == 1))] = [0, 255, 0]  # Green - True Positive
-    overlay[fp_mask := ((sam_mask_binary == 1) & (gt_mask_binary == 0))] = [0, 0, 255]  # Blue - False Positive
-    overlay[fn_mask := ((sam_mask_binary == 0) & (gt_mask_binary == 1))] = [255, 0, 0]  # Red - False Negative
-    axes[1, 0].imshow(overlay, alpha=0.5)
-    axes[1, 0].set_title('Overlay (Green=TP, Red=FN, Blue=FP)', fontsize=12, fontweight='bold')
-    axes[1, 0].axis('off')
+    overlay[(sam_mask_binary == 1) & (gt_mask_binary == 1)] = [0, 255, 0]  # Green - True Positive
+    overlay[(sam_mask_binary == 1) & (gt_mask_binary == 0)] = [0, 0, 255]  # Blue - False Positive
+    overlay[(sam_mask_binary == 0) & (gt_mask_binary == 1)] = [255, 0, 0]  # Red - False Negative
+    axes[2].imshow(overlay, alpha=0.6)
     
-    # Difference map
-    diff_map = np.abs(sam_mask_binary.astype(float) - gt_mask_binary.astype(float))
-    axes[1, 1].imshow(diff_map, cmap='hot')
-    axes[1, 1].set_title('Difference Map', fontsize=12, fontweight='bold')
-    axes[1, 1].axis('off')
-    
-    # Metrics text
-    axes[1, 2].axis('off')
-    metrics_text = f"""
-    Pixel Accuracy: {accuracy:.4f}
-    
-    Precision: {precision:.4f}
-    Recall: {recall:.4f}
-    F1-Score: {f1_score:.4f}
-    
-    IoU: {iou:.4f}
-    Dice Coefficient: {dice:.4f}
-    
-    True Positives: {tp}
-    False Positives: {fp}
-    True Negatives: {tn}
-    False Negatives: {fn}
-    """
-    axes[1, 2].text(0.1, 0.5, metrics_text, fontsize=11, family='monospace',
-                   verticalalignment='center', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-    axes[1, 2].set_title('Metrics', fontsize=12, fontweight='bold')
+    # Add metrics as text overlay
+    metrics_text = f'IoU: {iou:.3f} | Dice: {dice:.3f}\nPrecision: {precision:.3f} | Recall: {recall:.3f}'
+    axes[2].text(0.5, 0.98, metrics_text, transform=axes[2].transAxes, 
+                fontsize=11, fontweight='bold', ha='center', va='top',
+                bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    axes[2].set_title('SAM vs Ground Truth\n(Green=TP, Red=FN, Blue=FP)', fontsize=14, fontweight='bold')
+    axes[2].axis('off')
     
     # Overall title
-    fig.suptitle(title, fontsize=16, fontweight='bold')
-    plt.tight_layout()
+    fig.suptitle(title, fontsize=16, fontweight='bold', y=0.98)
+    plt.subplots_adjust(wspace=0.05)
     
     # Save or show
     if save_path:
@@ -429,121 +420,247 @@ def generate_shots_comparison_plot(input_dir: str, output_dir: str = None):
     print(f"\nFound {len(shots)} shot values: {shots}")
     print(f"Found {len(categories)} categories: {categories}")
     
-    metrics_to_plot = ['cosine', 'euclidean', 'knn']
-    metric_labels = {'cosine': 'Cosine Similarity', 'euclidean': 'Euclidean Distance', 'knn': 'k-NN Distance'}
+    # Plot: AUROC vs Shots for k-NN metric only (each category as a line + average)
+    fig, ax = plt.subplots(figsize=(10, 6))
     
-    # Plot 1: AUROC vs Shots for each category (all metrics)
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    if len(metrics_to_plot) == 1:
-        axes = [axes]
+    metric = 'knn'
     
-    for metric_idx, metric in enumerate(metrics_to_plot):
-        ax = axes[metric_idx]
+    # Plot each category
+    for category in categories:
+        aurocs = []
+        valid_shots = []
+        for n_shots in shots:
+            if category in all_shots_metrics[n_shots]:
+                try:
+                    aurocs.append(all_shots_metrics[n_shots][category][metric]['auroc'])
+                    valid_shots.append(n_shots)
+                except KeyError:
+                    continue
         
-        for category in categories:
-            aurocs = []
-            valid_shots = []
-            for n_shots in shots:
-                if category in all_shots_metrics[n_shots]:
-                    try:
-                        aurocs.append(all_shots_metrics[n_shots][category][metric]['auroc'])
-                        valid_shots.append(n_shots)
-                    except KeyError:
-                        continue
-            
-            if aurocs:
-                ax.plot(valid_shots, aurocs, marker='o', label=category, linewidth=2)
-        
-        ax.set_xlabel('Number of Shots', fontsize=12)
-        ax.set_ylabel('AUROC', fontsize=12)
-        ax.set_title(f'AUROC vs Shots - {metric_labels.get(metric, metric)}', fontsize=14)
-        ax.grid(True, alpha=0.3)
-        ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=10)
+        if aurocs:
+            ax.plot(valid_shots, aurocs, marker='o', label=category, linewidth=2, markersize=8)
     
+    # Calculate and plot average
+    avg_aurocs = []
+    for n_shots in shots:
+        aurocs = []
+        for cat in categories:
+            if cat in all_shots_metrics[n_shots]:
+                try:
+                    aurocs.append(all_shots_metrics[n_shots][cat][metric]['auroc'])
+                except KeyError:
+                    continue
+        if aurocs:
+            avg_aurocs.append(np.mean(aurocs))
+        else:
+            avg_aurocs.append(np.nan)
+    
+    ax.plot(shots, avg_aurocs, marker='s', label='Average', linewidth=3, markersize=10, 
+            color='black', linestyle='--')
+    
+    ax.set_xlabel('Number of Shots', fontsize=16, fontweight='bold')
+    ax.set_ylabel('AUROC', fontsize=16, fontweight='bold')
+    ax.set_title('AUROC vs Number of Shots (k-NN Metric)', fontsize=18, fontweight='bold')
+    ax.tick_params(axis='both', which='major', labelsize=14)
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=13, loc='best')
     plt.tight_layout()
-    plot_path = output_path / "auroc_vs_shots_all_metrics.png"
+    
+    plot_path = output_path / "auroc_vs_shots_knn.png"
     plt.savefig(plot_path, dpi=150, bbox_inches='tight')
     print(f"\nSaved plot to {plot_path}")
     plt.close()
     
-    # Plot 2: Average AUROC across all categories for each metric
-    fig, ax = plt.subplots(figsize=(10, 6))
-    
-    for metric in metrics_to_plot:
-        avg_aurocs = []
-        for n_shots in shots:
-            aurocs = []
-            for cat in categories:
-                if cat in all_shots_metrics[n_shots]:
-                    try:
-                        aurocs.append(all_shots_metrics[n_shots][cat][metric]['auroc'])
-                    except KeyError:
-                        continue
-            if aurocs:
-                avg_aurocs.append(np.mean(aurocs))
-            else:
-                avg_aurocs.append(np.nan)
-        
-        ax.plot(shots, avg_aurocs, marker='o', label=metric_labels.get(metric, metric), 
-                linewidth=2, markersize=8)
-    
-    ax.set_xlabel('Number of Shots', fontsize=12)
-    ax.set_ylabel('Average AUROC', fontsize=12)
-    ax.set_title('Average AUROC vs Number of Shots (All Categories)', fontsize=14, fontweight='bold')
-    ax.grid(True, alpha=0.3)
-    ax.legend(fontsize=11)
-    plt.tight_layout()
-    
-    avg_plot_path = output_path / "average_auroc_vs_shots.png"
-    plt.savefig(avg_plot_path, dpi=150, bbox_inches='tight')
-    print(f"Saved average plot to {avg_plot_path}")
-    plt.close()
-    
-    # Plot 3: Heatmap showing AUROC for each category and shot count (cosine metric)
-    fig, ax = plt.subplots(figsize=(12, max(6, len(categories) * 0.8)))
-    
-    # Create data matrix
-    data_matrix = np.zeros((len(categories), len(shots)))
-    for i, category in enumerate(categories):
-        for j, n_shots in enumerate(shots):
-            if category in all_shots_metrics[n_shots]:
-                try:
-                    data_matrix[i, j] = all_shots_metrics[n_shots][category]['cosine']['auroc']
-                except KeyError:
-                    data_matrix[i, j] = np.nan
-            else:
-                data_matrix[i, j] = np.nan
-    
-    im = ax.imshow(data_matrix, cmap='RdYlGn', aspect='auto', vmin=0.7, vmax=1.0)
-    
-    # Set ticks and labels
-    ax.set_xticks(np.arange(len(shots)))
-    ax.set_yticks(np.arange(len(categories)))
-    ax.set_xticklabels(shots)
-    ax.set_yticklabels(categories)
-    
-    # Add colorbar
-    cbar = plt.colorbar(im, ax=ax)
-    cbar.set_label('AUROC (Cosine)', rotation=270, labelpad=20, fontsize=11)
-    
-    # Add text annotations
-    for i in range(len(categories)):
-        for j in range(len(shots)):
-            if not np.isnan(data_matrix[i, j]):
-                text = ax.text(j, i, f'{data_matrix[i, j]:.3f}',
-                             ha="center", va="center", color="black", fontsize=9)
-    
-    ax.set_xlabel('Number of Shots', fontsize=12)
-    ax.set_ylabel('Category', fontsize=12)
-    ax.set_title('AUROC Heatmap: Categories vs Shots (Cosine Metric)', fontsize=14, fontweight='bold')
-    plt.tight_layout()
-    
-    heatmap_path = output_path / "auroc_heatmap.png"
-    plt.savefig(heatmap_path, dpi=150, bbox_inches='tight')
-    print(f"Saved heatmap to {heatmap_path}")
-    plt.close()
-    
     print(f"\nAll plots saved to {output_path}")
+
+
+def generate_metrics_comparison_plot(results_dir: str, output_dir: str = None):
+    """
+    Generate bar plots comparing all metrics (cosine, euclidean, k-NN) across categories.
+    Also prints a comprehensive summary table of all metrics.
+    
+    Args:
+        results_dir: Path to directory containing category subdirectories with metrics.json files
+                     (e.g., 'results/hazelnut_carpet_bottle_nosam_fewshot_5/')
+        output_dir: Directory to save plots (if None, saves to results_dir)
+    
+    The function expects a directory structure like:
+        results_dir/
+            category1/
+                metrics.json
+            category2/
+                metrics.json
+            ...
+    """
+    results_path = Path(results_dir)
+    
+    if not results_path.exists():
+        print(f"Error: Directory not found: {results_dir}")
+        return
+    
+    output_path = Path(output_dir) if output_dir else results_path
+    output_path.mkdir(parents=True, exist_ok=True)
+    
+    # Collect all metrics from subdirectories
+    all_metrics = {}
+    
+    for category_dir in results_path.iterdir():
+        if category_dir.is_dir():
+            metrics_file = category_dir / "metrics.json"
+            if metrics_file.exists():
+                category_name = category_dir.name
+                with open(metrics_file, 'r') as f:
+                    all_metrics[category_name] = json.load(f)
+    
+    if not all_metrics:
+        print(f"Error: No metrics.json files found in subdirectories of {results_dir}")
+        return
+    
+    categories = sorted(all_metrics.keys())
+    print(f"\nFound {len(categories)} categories: {categories}")
+    
+    # Extract metrics for all three methods
+    metrics_names = ['cosine', 'euclidean', 'knn']
+    metric_labels = {'cosine': 'Cosine Similarity', 'euclidean': 'Euclidean Distance', 'knn': 'k-NN Distance'}
+    
+    # Prepare data for plotting
+    auroc_data = {metric: [] for metric in metrics_names}
+    
+    for category in categories:
+        for metric in metrics_names:
+            try:
+                auroc = all_metrics[category][metric]['auroc']
+                auroc_data[metric].append(auroc)
+            except KeyError:
+                auroc_data[metric].append(0)  # Default if missing
+    
+    # Create bar plot
+    fig, ax = plt.subplots(figsize=(max(12, len(categories) * 1.5), 6))
+    
+    x = np.arange(len(categories))
+    width = 0.25
+    
+    bars1 = ax.bar(x - width, auroc_data['cosine'], width, label=metric_labels['cosine'], alpha=0.8)
+    bars2 = ax.bar(x, auroc_data['euclidean'], width, label=metric_labels['euclidean'], alpha=0.8)
+    bars3 = ax.bar(x + width, auroc_data['knn'], width, label=metric_labels['knn'], alpha=0.8)
+    
+    ax.set_xlabel('Category', fontsize=16, fontweight='bold')
+    ax.set_ylabel('AUROC', fontsize=16, fontweight='bold')
+    ax.set_title('AUROC Comparison Across Categories and Metrics', fontsize=18, fontweight='bold')
+    ax.set_xticks(x)
+    ax.set_xticklabels(categories, rotation=45, ha='right', fontsize=14)
+    ax.tick_params(axis='y', labelsize=14)
+    ax.legend(fontsize=13)
+    ax.grid(True, alpha=0.3, axis='y')
+    ax.set_ylim([0.4, 1.05])    
+    
+    # Add value labels on bars
+    for bars in [bars1, bars2, bars3]:
+        for bar in bars:
+            height = bar.get_height()
+            ax.annotate(f'{height:.3f}',
+                       xy=(bar.get_x() + bar.get_width() / 2, height),
+                       xytext=(0, 3),
+                       textcoords="offset points",
+                       ha='center', va='bottom', fontsize=11)
+    
+    plt.tight_layout()
+    plot_path = output_path / "metrics_comparison_barplot_3.png"
+    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+    print(f"\nSaved bar plot to {plot_path}")
+    plt.close()
+    
+    # Print comprehensive summary table
+    print(f"\n{'='*120}")
+    print(f"COMPREHENSIVE METRICS SUMMARY")
+    print(f"{'='*120}")
+    
+    # Print detailed table for each metric
+    for metric in metrics_names:
+        print(f"\n{metric_labels[metric]}:")
+        print(f"{'-'*120}")
+        print(f"{'Category':<20} {'AUROC':<12} {'Precision':<12} {'Recall':<12} {'F1 Score':<12} {'Avg Prec':<12}")
+        print(f"{'-'*120}")
+        
+        auroc_values = []
+        precision_values = []
+        recall_values = []
+        f1_values = []
+        ap_values = []
+        
+        for category in categories:
+            try:
+                m = all_metrics[category][metric]
+                auroc = m.get('auroc', 0)
+                precision = m.get('precision', 0)
+                recall = m.get('recall', 0)
+                f1 = m.get('f1_score', 0)
+                avg_precision = m.get('average_precision', 0)
+                
+                auroc_values.append(auroc)
+                precision_values.append(precision)
+                recall_values.append(recall)
+                f1_values.append(f1)
+                ap_values.append(avg_precision)
+                
+                print(f"{category:<20} {auroc:<12.4f} {precision:<12.4f} {recall:<12.4f} {f1:<12.4f} {avg_precision:<12.4f}")
+            except KeyError:
+                print(f"{category:<20} {'N/A':<12} {'N/A':<12} {'N/A':<12} {'N/A':<12} {'N/A':<12}")
+        
+        # Print means
+        if auroc_values:
+            print(f"{'-'*120}")
+            print(f"{'MEAN':<20} {np.mean(auroc_values):<12.4f} {np.mean(precision_values):<12.4f} {np.mean(recall_values):<12.4f} {np.mean(f1_values):<12.4f} {np.mean(ap_values):<12.4f}")
+    
+    print(f"{'='*120}\n")
+    
+    # Save summary to text file
+    summary_file = output_path / "metrics_summary.txt"
+    with open(summary_file, 'w') as f:
+        f.write("="*120 + "\n")
+        f.write("COMPREHENSIVE METRICS SUMMARY\n")
+        f.write("="*120 + "\n\n")
+        
+        for metric in metrics_names:
+            f.write(f"\n{metric_labels[metric]}:\n")
+            f.write("-"*120 + "\n")
+            f.write(f"{'Category':<20} {'AUROC':<12} {'Precision':<12} {'Recall':<12} {'F1 Score':<12} {'Avg Prec':<12}\n")
+            f.write("-"*120 + "\n")
+            
+            auroc_values = []
+            precision_values = []
+            recall_values = []
+            f1_values = []
+            ap_values = []
+            
+            for category in categories:
+                try:
+                    m = all_metrics[category][metric]
+                    auroc = m.get('auroc', 0)
+                    precision = m.get('precision', 0)
+                    recall = m.get('recall', 0)
+                    f1 = m.get('f1_score', 0)
+                    avg_precision = m.get('average_precision', 0)
+                    
+                    auroc_values.append(auroc)
+                    precision_values.append(precision)
+                    recall_values.append(recall)
+                    f1_values.append(f1)
+                    ap_values.append(avg_precision)
+                    
+                    f.write(f"{category:<20} {auroc:<12.4f} {precision:<12.4f} {recall:<12.4f} {f1:<12.4f} {avg_precision:<12.4f}\n")
+                except KeyError:
+                    f.write(f"{category:<20} {'N/A':<12} {'N/A':<12} {'N/A':<12} {'N/A':<12} {'N/A':<12}\n")
+            
+            if auroc_values:
+                f.write("-"*120 + "\n")
+                f.write(f"{'MEAN':<20} {np.mean(auroc_values):<12.4f} {np.mean(precision_values):<12.4f} {np.mean(recall_values):<12.4f} {np.mean(f1_values):<12.4f} {np.mean(ap_values):<12.4f}\n")
+            f.write("\n")
+        
+        f.write("="*120 + "\n")
+    
+    print(f"Saved summary to {summary_file}")
+    print(f"All outputs saved to {output_path}\n")
 
 
 
@@ -553,35 +670,50 @@ def generate_shots_comparison_plot(input_dir: str, output_dir: str = None):
 
 
 
-############################# Compare SAM Mask with Ground Truth ##############################
-# Load your data
-image = cv2.imread(Path(__file__).parent.parent / "mvtec_ad/hazelnut/test/crack/007.png")
-image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-sam_mask = np.load(Path(__file__).parent / "results/hazelnut_sam_fewshot_1/visualizations/007_sam_mask.npy")  # Or however you get the SAM mask
+# ############################# Compare SAM Mask with Ground Truth ##############################
+# # Load your data
+# image = cv2.imread(str(Path(__file__).parent.parent / "mvtec_ad/hazelnut/test/crack/007.png"))
+# image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+# sam_mask = np.load(str(Path(__file__).parent / "results/hazelnut_sam_fewshot_1/visualizations/007_sam_mask.npy"))  # Or however you get the SAM mask
 
-# Compare and visualize
-metrics = compare_sam_mask_with_groundtruth(
-    sam_mask=sam_mask,
-    groundtruth_mask_path=Path(__file__).parent.parent / "mvtec_ad/hazelnut/ground_truth/crack/007_mask.png",
-    image=image,
-    save_path=Path(__file__).parent / "Possible_Report_Visualizations/Comparison_Ground_Truth_with_SAM.png",
-    title="SAM vs Ground Truth - Bottle Defect"
-)
+# # Load heatmap PNG
+# heatmap_path = Path(__file__).parent / "results/hazelnut_sam_fewshot_1/visualizations/007_heatmap_only.png"
+# print(f"Loading heatmap from: {heatmap_path}")
+# print(f"Heatmap file exists: {heatmap_path.exists()}")
+# heatmap = cv2.imread(str(heatmap_path))
+# print(f"Heatmap loaded successfully: {heatmap is not None}")
+# if heatmap is not None:
+#     print(f"Heatmap shape: {heatmap.shape}")
 
-print(f"Accuracy: {metrics['accuracy']:.4f}")
-print(f"IoU: {metrics['iou']:.4f}")
+# # Compare and visualize
+# metrics = compare_sam_mask_with_groundtruth(
+#     sam_mask=sam_mask,
+#     groundtruth_mask_path=Path(__file__).parent.parent / "mvtec_ad/hazelnut/ground_truth/crack/007_mask.png",
+#     image=image,
+#     heatmap=heatmap,
+#     save_path=Path(__file__).parent / "Possible_Report_Visualizations/Comparison_Ground_Truth_with_SAM_Hazelnut.png",
+#     title="SAM vs Ground Truth - Hazelnut"
+# )
 
-############################## Plot Anomaly Scores ##############################
+# print(f"Accuracy: {metrics['accuracy']:.4f}")
+# print(f"IoU: {metrics['iou']:.4f}")
 
-input_path = Path(__file__).parent / "results/hazelnut_bottle_transistor_wood_multi_shot_5_10_15_20_25_30_nosam/all_shots_results.json"
-output_path = Path(__file__).parent / "results/hazelnut_bottle_transistor_wood_multi_shot_5_10_15_20_25_30_nosam"
+# ############################## Plot Anomaly Scores ##############################
+
+input_path = Path(__file__).parent / "results/hazelnut_carpet_bottle_screw_cable_multi_shot_1_5_10_25_50_100_200_nosam/all_shots_results.json"
+output_path = Path(__file__).parent / "results/hazelnut_carpet_bottle_screw_cable_multi_shot_1_5_10_25_50_100_200_nosam"
 generate_shots_comparison_plot(input_path, output_path)
 
-# ############################## Analyze Anomaly Detection Results ##############################
-# Example usage: Analyze anomaly scores from a specific experiment
-anomaly_scores_path = Path(__file__).parent / "results/transistor_nosam_fewshot_5/anomaly_scores.npz"
-output_dir = Path(__file__).parent / "results/transistor_nosam_fewshot_5/analysis_plots"
+# # ############################## Analyze Anomaly Detection Results ##############################
+# # Example usage: Analyze anomaly scores from a specific experiment
+# anomaly_scores_path = Path(__file__).parent / "results/transistor_nosam_fewshot_5/anomaly_scores.npz"
+# output_dir = Path(__file__).parent / "results/transistor_nosam_fewshot_5/analysis_plots"
 
-plot_anomaly_scores(anomaly_scores_path, output_dir)
+# plot_anomaly_scores(anomaly_scores_path, output_dir)
 
 
+################################ Compare Metrics Across Categories ##############################
+# flags to generate data: --category hazelnut carpet bottle screw cable --few-shot --n-shots 5 --k-neighbors 5
+# results_dir = Path(__file__).parent / "results/bottle_cable_carpet_hazelnut_screw_nosam_fewshot_5"
+# output_dir = Path(__file__).parent / "results/bottle_cable_carpet_hazelnut_screw_nosam_fewshot_5"
+# generate_metrics_comparison_plot(results_dir, output_dir)
