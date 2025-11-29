@@ -8,6 +8,7 @@ import json
 import os
 import cv2
 from PIL import Image
+from scipy.stats import gaussian_kde
 
 
 def compare_sam_mask_with_groundtruth(
@@ -203,15 +204,19 @@ def plot_anomaly_scores(anomaly_scores_path: str, output_dir: str = None):
     print(f"Labels shape: {labels.shape}")
     print(f"Normal samples: {np.sum(labels == 0)}, Anomaly samples: {np.sum(labels == 1)}")
 
+    # Only show k-NN results in these plots (reduce clutter)
     metrics_dict = {
-        'Cosine Similarity': scores_cosine,
-        'Euclidean Distance': scores_euclidean,
         'k-NN Distance': scores_knn
     }
 
+    # Number of metrics to plot (kept dynamic to support single/multiple metrics)
+    n_metrics = len(metrics_dict)
+
     # 1. Score Distribution (Histograms)
-    print("\nGenerating score distribution plots...")
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    print("\nGenerating score distribution plots (k-NN only)...")
+    fig, axes = plt.subplots(1, n_metrics, figsize=(5 * n_metrics, 4))
+    if n_metrics == 1:
+        axes = [axes]
     for idx, (metric_name, scores) in enumerate(metrics_dict.items()):
         axes[idx].hist(scores[labels == 0], bins=20, alpha=0.7, label="Normal", color='blue')
         axes[idx].hist(scores[labels == 1], bins=20, alpha=0.7, label="Anomaly", color='red')
@@ -226,28 +231,64 @@ def plot_anomaly_scores(anomaly_scores_path: str, output_dir: str = None):
     plt.close()
 
     # 2. Density Plots
-    print("Generating density plots...")
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    print("Generating density plots (k-NN only) — normalized to peak=1 for comparability...")
+    fig, axes = plt.subplots(1, n_metrics, figsize=(5 * n_metrics, 4))
+    if n_metrics == 1:
+        axes = [axes]
+
     for idx, (metric_name, scores) in enumerate(metrics_dict.items()):
-        sns.kdeplot(scores[labels == 0], fill=True, label="Normal", ax=axes[idx], color='blue')
-        sns.kdeplot(scores[labels == 1], fill=True, label="Anomaly", ax=axes[idx], color='red')
+        # Compute KDE for normal and anomaly samples on a shared grid
+        scores_normal = scores[labels == 0]
+        scores_anom = scores[labels == 1]
+
+        # Fallback to seaborn if one of the groups has too few samples for gaussian_kde
+        use_kde = len(scores_normal) > 1 and len(scores_anom) > 1
+
+        min_val = np.min(scores)
+        max_val = np.max(scores)
+        grid = np.linspace(min_val, max_val, 512)
+
+        if use_kde:
+            kde_n = gaussian_kde(scores_normal)
+            kde_a = gaussian_kde(scores_anom)
+            dens_n = kde_n(grid)
+            dens_a = kde_a(grid)
+
+            # Normalize each density to its peak value so both curves range [0, 1]
+            if np.max(dens_n) > 0:
+                dens_n = dens_n / np.max(dens_n)
+            if np.max(dens_a) > 0:
+                dens_a = dens_a / np.max(dens_a)
+
+            axes[idx].plot(grid, dens_n, color='blue', linewidth=2, label='Normal')
+            axes[idx].fill_between(grid, dens_n, color='blue', alpha=0.3)
+            axes[idx].plot(grid, dens_a, color='red', linewidth=2, label='Anomaly')
+            axes[idx].fill_between(grid, dens_a, color='red', alpha=0.3)
+            axes[idx].set_ylim(0, 1.05)
+        else:
+            # Fallback to seaborn kdeplot which will estimate density but may not normalize peaks
+            sns.kdeplot(scores_normal, fill=True, label="Normal", ax=axes[idx], color='blue')
+            sns.kdeplot(scores_anom, fill=True, label="Anomaly", ax=axes[idx], color='red')
+
         axes[idx].set_xlabel("Anomaly Score", fontsize=11)
-        axes[idx].set_ylabel("Density", fontsize=11)
+        axes[idx].set_ylabel("Normalized Density (peak=1)", fontsize=11)
         axes[idx].set_title(f"Score Density - {metric_name}", fontsize=12, fontweight='bold')
         axes[idx].legend()
         axes[idx].grid(alpha=0.3)
+
     plt.tight_layout()
     plt.savefig(output_dir / "02_score_densities.png", dpi=150, bbox_inches='tight')
     print(f"  Saved: {output_dir / '02_score_densities.png'}")
     plt.close()
 
     # 3. Scatter Plots (sorted by label for clarity)
-    print("Generating scatter plots...")
+    print("Generating scatter plots (k-NN only)...")
     # Sort samples: normal first, then anomalous
     sort_idx = np.argsort(labels)
     labels_sorted = labels[sort_idx]
-    
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    fig, axes = plt.subplots(1, n_metrics, figsize=(5 * n_metrics, 4))
+    if n_metrics == 1:
+        axes = [axes]
     for idx, (metric_name, scores) in enumerate(metrics_dict.items()):
         scores_sorted = scores[sort_idx]
         scatter = axes[idx].scatter(range(len(scores_sorted)), scores_sorted, c=labels_sorted, cmap="coolwarm", alpha=0.7, s=30)

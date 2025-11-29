@@ -842,9 +842,7 @@ def visualize_sam_enhanced_results(
             fig_heatmap, ax = plt.subplots(1, 1, figsize=(5, 5))
             ax.imshow(image_np)
             im = ax.imshow(anomaly_heatmap, alpha=0.7, cmap='hot')
-            ax.set_title('Anomaly Heatmap (No SAM)', fontsize=12)
             ax.axis('off')
-            plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
             # Extract image number from base_name if present, otherwise use base_name as is
             if '_' in base_name:
                 img_num = base_name.split('_')[0]
