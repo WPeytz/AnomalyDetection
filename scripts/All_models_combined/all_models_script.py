@@ -212,18 +212,29 @@ class SAMIntegrator:
     Integrates SAM with anomaly detection for enhanced localization.
     """
     
-    def __init__(self, sam_checkpoint: Optional[str] = None, model_type: str = "vit_h", device: str = "cuda"):
+    def __init__(self, sam_checkpoint: Optional[str] = None, model_type: str = "vit_h", device: str = "auto"):
         """
         Initialize SAM integrator.
         
         Args:
             sam_checkpoint: Path to SAM checkpoint file
             model_type: SAM model type ('vit_h', 'vit_l', 'vit_b')
-            device: Device to use ('cuda' or 'cpu')
+            device: Device to use ('auto', 'cuda', 'mps', or 'cpu')
+                   'auto' will select MPS (Apple Silicon) > CUDA > CPU
         """
         self.sam_available = SAM_AVAILABLE and sam_checkpoint is not None
         self.predictor = None
-        self.device = device if torch.cuda.is_available() else "cpu"
+        
+        # Smart device detection with MPS priority for M2 MacBook
+        if device == "auto":
+            if torch.backends.mps.is_available():
+                self.device = "mps"
+            elif torch.cuda.is_available():
+                self.device = "cuda"
+            else:
+                self.device = "cpu"
+        else:
+            self.device = device
         
         if self.sam_available:
             try:
@@ -241,98 +252,210 @@ class SAMIntegrator:
             else:
                 print("SAM checkpoint not provided - using fallback methods")
     
-    def get_bbox_from_anomaly_map(self, anomaly_map: np.ndarray, threshold_percentile: float = 85) -> Tuple[int, int, int, int]:
-        """
-        Extract bounding box from anomaly heatmap.
+    # def get_bbox_from_anomaly_map(self, anomaly_map: np.ndarray, threshold_percentile: float = 85) -> Tuple[int, int, int, int]:
+    #     """
+    #     Extract bounding box from anomaly heatmap.
         
-        Args:
-            anomaly_map: 2D anomaly heatmap
-            threshold_percentile: Percentile for thresholding (higher = less area, more conservative)
-                                 Default 85 focuses on top 15% hottest regions
+    #     Args:
+    #         anomaly_map: 2D anomaly heatmap
+    #         threshold_percentile: Percentile for thresholding (higher = less area, more conservative)
+    #                              Default 85 focuses on top 15% hottest regions
             
-        Returns:
-            Bounding box (x_min, y_min, x_max, y_max)
-        """
-        # Threshold the map - use higher percentile to focus on hottest regions only
-        threshold = np.percentile(anomaly_map, threshold_percentile)
-        binary_map = anomaly_map > threshold
+    #     Returns:
+    #         Bounding box (x_min, y_min, x_max, y_max)
+    #     """
+    #     # Threshold the map - use higher percentile to focus on hottest regions only
+    #     threshold = np.percentile(anomaly_map, threshold_percentile)
+    #     binary_map = anomaly_map > threshold
         
-        if not binary_map.any():
-            # Fallback to center region if no anomalies found
-            h, w = anomaly_map.shape
-            return (w//4, h//4, 3*w//4, 3*h//4)
+    #     if not binary_map.any():
+    #         # Fallback to center region if no anomalies found
+    #         h, w = anomaly_map.shape
+    #         return (w//4, h//4, 3*w//4, 3*h//4)
         
-        # Find connected components and get largest one
-        labeled, num_features = ndimage.label(binary_map)
-        if num_features == 0:
-            h, w = anomaly_map.shape
-            return (w//4, h//4, 3*w//4, 3*h//4)
+    #     # Find connected components and get largest one
+    #     labeled, num_features = ndimage.label(binary_map)
+    #     if num_features == 0:
+    #         h, w = anomaly_map.shape
+    #         return (w//4, h//4, 3*w//4, 3*h//4)
         
-        # Get largest component
-        component_sizes = ndimage.sum(binary_map, labeled, range(1, num_features + 1))
-        largest_component = np.argmax(component_sizes) + 1
-        largest_mask = labeled == largest_component
+    #     # Get largest component
+    #     component_sizes = ndimage.sum(binary_map, labeled, range(1, num_features + 1))
+    #     largest_component = np.argmax(component_sizes) + 1
+    #     largest_mask = labeled == largest_component
         
-        # Get bounding box
-        coords = np.where(largest_mask)
-        y_min, y_max = coords[0].min(), coords[0].max()
-        x_min, x_max = coords[1].min(), coords[1].max()
+    #     # Get bounding box
+    #     coords = np.where(largest_mask)
+    #     y_min, y_max = coords[0].min(), coords[0].max()
+    #     x_min, x_max = coords[1].min(), coords[1].max()
         
-        return (x_min, y_min, x_max, y_max)
+    #     return (x_min, y_min, x_max, y_max)
     
-    def predict_mask_from_bbox(self, image: np.ndarray, bbox: Tuple[int, int, int, int], anomaly_map: Optional[np.ndarray] = None) -> Optional[np.ndarray]:
-        """
-        Predict segmentation mask using SAM from bounding box and anomaly heatmap.
-        
-        Args:
-            image: RGB image (H, W, 3)
-            bbox: Bounding box (x_min, y_min, x_max, y_max)
-            anomaly_map: 2D anomaly heatmap to extract point prompts from hottest regions
+    # 
+    # def predict_mask_from_heatmap(self, image: np.ndarray, anomaly_map: np.ndarray, top_k_points: int = 5) -> Optional[np.ndarray]:
+    #     if not self.sam_available:
+    #         return None
+
+    #     try:
+    #         self.predictor.set_image(image)
             
-        Returns:
-            Binary mask or None if SAM not available
+    #         # 1. Smooth the heatmap slightly to avoid single noisy pixels
+    #         # A small gaussian blur helps find the "center" of the defect
+    #         smooth_map = cv2.GaussianBlur(anomaly_map, (5, 5), 0)
+            
+    #         # 2. Find the coordinates of the highest scores
+    #         # Flatten the array to sort scores
+    #         flat_indices = np.argsort(smooth_map.ravel())[-top_k_points:]
+            
+    #         # Convert back to (x, y) coordinates
+    #         # np.unravel_index returns (row, col) -> (y, x)
+    #         y_coords, x_coords = np.unravel_index(flat_indices, smooth_map.shape)
+            
+    #         # Stack into (N, 2) array for SAM. Note: SAM expects (x, y)
+    #         point_coords = np.column_stack([x_coords, y_coords])
+    #         point_labels = np.ones(len(point_coords)) # 1 = Foreground/Positive prompt
+
+    #         # 3. (Optional but recommended) Add Negative Prompts
+    #         # Find the lowest scoring region to tell SAM "this is definitely background"
+    #         flat_indices_neg = np.argsort(smooth_map.ravel())[:3]
+    #         y_neg, x_neg = np.unravel_index(flat_indices_neg, smooth_map.shape)
+    #         point_coords_neg = np.column_stack([x_neg, y_neg])
+    #         point_coords = np.concatenate([point_coords, point_coords_neg], axis=0)
+    #         point_labels = np.concatenate([point_labels, np.zeros(len(point_coords_neg))], axis=0)
+
+    #         # 4. Predict
+    #         masks, scores, logits = self.predictor.predict(
+    #             point_coords=point_coords,
+    #             point_labels=point_labels,
+    #             multimask_output=True, # Allow SAM to offer different ambiguity levels
+    #         )
+
+    #         # 5. Selection Strategy:
+    #         # SAM returns 3 masks. Usually, index 0 is the most compact, index 2 is the most loose.
+    #         # For anomalies, we often want the mask that covers the heatmap area best.
+            
+    #         # Heuristic: Pick the mask that maximizes overlap with your anomaly heatmap
+    #         best_score = -1
+    #         best_mask = masks[0]
+            
+    #         for i, mask in enumerate(masks):
+    #             # Calculate overlap with the raw anomaly map
+    #             # Sum of anomaly scores inside the mask
+    #             overlap_score = np.sum(anomaly_map * mask) 
+                
+    #             # Normalize by mask area (to avoid just picking the biggest mask)
+    #             # This is essentially "Mean Anomaly Score inside Mask"
+    #             mask_area = np.sum(mask) + 1e-6
+    #             mean_score = overlap_score / mask_area
+                
+    #             if mean_score > best_score:
+    #                 best_score = mean_score
+    #                 best_mask = mask
+
+    #         return self._clean_mask(best_mask)
+
+    #     except Exception as e:
+    #         print(f"SAM prediction failed: {e}")
+    #         return None
+    def predict_mask_from_heatmap(self, image: np.ndarray, anomaly_map: np.ndarray, top_k_points: int = 6) -> Optional[np.ndarray]:
+        """
+        Predict mask using the 'Buffer Zone' strategy.
+        - Positives: Sampled from high-confidence core (>0.65)
+        - Negatives: Sampled from definite background (<0.25)
+        - Buffer: 0.25-0.65 is left empty to allow mask expansion.
         """
         if not self.sam_available:
             return None
-            
+
         try:
             self.predictor.set_image(image)
             
-            # Use point prompts from heatmap peaks if available (NO BBOX for more precision)
-            # Use the bounding box as SAM prompt (box) for segmentation
-            if anomaly_map is not None:
-                # Use the provided bbox to constrain SAM prediction
-                x_min, y_min, x_max, y_max = bbox
-                box_np = np.array([x_min, y_min, x_max, y_max])
-                masks, scores, logits = self.predictor.predict(
-                    box=box_np,
-                    multimask_output=True,
-                )
-                # Select the mask with the highest score to prefer confident masks
-                try:
-                    best_idx = int(np.argmax(scores))
-                except Exception:
-                    best_idx = 0
-                mask = masks[best_idx]
-                # Apply morphological cleaning (conservative)
-                mask = self._clean_mask(mask, kernel_size=5, min_area=100)
-                return mask
+            # Smooth heatmap slightly
+            smooth_map = cv2.GaussianBlur(anomaly_map, (3, 3), 0)
             
-            # Fallback: still use bbox if anomaly_map isn't available
-            x_min, y_min, x_max, y_max = bbox
-            box_np = np.array([x_min, y_min, x_max, y_max])
+            # --- 1. DEFINE ZONES ---
+            # Using fixed relative thresholds (works well with normalized maps)
+            # You can tune these, but 0.65/0.25 is a robust starting point.
+            pos_thresh = 0.65
+            neg_thresh = 0.25
+            
+            # --- 2. POSITIVE PROMPTS (Cluster Centers) ---
+            # Find high-confidence islands
+            pos_mask = (smooth_map > pos_thresh).astype(np.uint8)
+            num_labels, labels = cv2.connectedComponents(pos_mask)
+            
+            pos_points = []
+            
+            if num_labels > 1:
+                # Sample the peak of each distinct anomaly island
+                for i in range(1, num_labels):
+                    blob_vals = smooth_map.copy()
+                    blob_vals[labels != i] = -1
+                    y_c, x_c = np.unravel_index(np.argmax(blob_vals), smooth_map.shape)
+                    pos_points.append([x_c, y_c])
+                    if len(pos_points) >= top_k_points: break
+            else:
+                # Fallback: Just the global max
+                y_c, x_c = np.unravel_index(np.argmax(smooth_map), smooth_map.shape)
+                pos_points.append([x_c, y_c])
+                
+            coords_pos = np.array(pos_points)
+            labels_pos = np.ones(len(coords_pos))
+
+            # --- 3. NEGATIVE PROMPTS (Safe Zone Only) ---
+            # Only pick points that are definitely NOT anomaly (< neg_thresh)
+            # This leaves the 0.25-0.65 range free for SAM to decide.
+            neg_mask = smooth_map < neg_thresh
+            y_neg, x_neg = np.where(neg_mask)
+            
+            # Sample negatives randomly
+            if len(x_neg) > 0:
+                num_neg = top_k_points * 2 
+                indices = np.linspace(0, len(x_neg)-1, num_neg, dtype=int)
+                coords_neg = np.column_stack([x_neg[indices], y_neg[indices]])
+                labels_neg = np.zeros(len(coords_neg))
+                
+                point_coords = np.concatenate([coords_pos, coords_neg], axis=0)
+                point_labels = np.concatenate([labels_pos, labels_neg], axis=0)
+            else:
+                point_coords = coords_pos
+                point_labels = labels_pos
+
+            # --- 4. PREDICT ---
             masks, scores, logits = self.predictor.predict(
-                box=box_np,
-                multimask_output=True,
+                point_coords=point_coords,
+                point_labels=point_labels,
+                multimask_output=True, 
             )
-            try:
-                best_idx = int(np.argmax(scores))
-            except Exception:
-                best_idx = 0
-            mask = masks[best_idx]
-            mask = self._clean_mask(mask, kernel_size=5, min_area=100)
-            return mask
+
+            # --- 5. SELECTION (Relaxed) ---
+            # We removed the 'expansion_ratio' penalty which was killing Bottle masks.
+            # Instead, we select based on IoU with a "Broad Target".
             
+            best_score = -1
+            best_mask = masks[0]
+            
+            # Target: Anything "Warm" (>0.35) should probably be masked
+            target_mask = smooth_map > 0.35
+            
+            for mask in masks:
+                # Calculate Intersection over Union with the Broad Target
+                intersection = np.logical_and(mask, target_mask).sum()
+                union = np.logical_or(mask, target_mask).sum()
+                iou = intersection / (union + 1e-6)
+                
+                # Simple sanity check: Don't select masks that cover the whole image
+                # (e.g., > 50% of pixels). MVTec defects are rarely that big.
+                coverage = mask.sum() / mask.size
+                if coverage > 0.5: 
+                    iou *= 0.1 # Heavily penalize massive flooding
+                
+                if iou > best_score:
+                    best_score = iou
+                    best_mask = mask
+
+            return self._clean_mask(best_mask)
+
         except Exception as e:
             print(f"SAM prediction failed: {e}")
             return None
@@ -892,6 +1015,27 @@ def visualize_anomaly_map(
     )
 
 
+def normalize_heatmap_inside_mask(heatmap: np.ndarray, obj_mask: np.ndarray) -> np.ndarray:
+    """
+    Normalizes heatmap values ONLY within the object mask.
+    """
+    normalized_map = np.zeros_like(heatmap)
+    valid_pixels = heatmap[obj_mask > 0]
+    
+    if len(valid_pixels) == 0: return heatmap
+        
+    local_min = valid_pixels.min()
+    local_max = valid_pixels.max()
+    
+    if local_max - local_min < 1e-6: return heatmap
+        
+    # Linear normalization only - NO GAMMA CORRECTION
+    normalized_pixels = (valid_pixels - local_min) / (local_max - local_min)
+    normalized_map[obj_mask > 0] = normalized_pixels
+    
+    return normalized_map
+
+
 def run_sam_enhanced_anomaly_detection(
     category: str,
     root_dir: str = "mvtec_ad",
@@ -938,9 +1082,8 @@ def run_sam_enhanced_anomaly_detection(
     output_dir = script_dir / output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Initialize SAM
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    sam_integrator = SAMIntegrator(sam_checkpoint, model_type=sam_model_type, device=device)
+    # Initialize SAM with auto device detection
+    sam_integrator = SAMIntegrator(sam_checkpoint, model_type=sam_model_type, device="auto")
 
     # Initialize DINOv3 model
     print(f"Loading model: {model_name}")
@@ -1173,51 +1316,112 @@ def run_sam_enhanced_anomaly_detection(
     # Generate anomaly heatmaps for all images (only if visualizations are needed)
     sam_masks = []
     anomaly_heatmaps = []
-    bboxes = []
+    #bboxes = []
+    bboxes = [None] * len(anomaly_scores) # *New
     
     if save_visualizations and patch_level_scores is not None:
         print(f"Generating anomaly heatmaps for {len(anomaly_scores)} images...")
-        print(f"Patch scores per image: {patch_level_scores.shape[1]}")
         
-        # Generate heatmaps and bounding boxes for all images
+        # 1. Generate Raw Heatmaps
         for i in range(len(anomaly_scores)):
             heatmap = create_anomaly_heatmap(patch_level_scores[i], image_size=image_size)
             anomaly_heatmaps.append(heatmap)
-            
-            # Get bounding box from anomaly heatmap
-            bbox = sam_integrator.get_bbox_from_anomaly_map(heatmap)
-            bboxes.append(bbox)
         
-        # Apply SAM post-processing if available
+        # 2. Apply SAM post-processing
         if sam_integrator.sam_available:
-            print("Applying SAM post-processing (anomalous samples only)...")
+            print("Applying SAM post-processing (Background Suppression + Anomaly Detection)...")
             
             for i in range(len(anomaly_scores)):
-                # Get test image
                 sample = test_dataset[i]
                 
-                # Only apply SAM to anomalous samples (label=1)
-                # Skip normal samples (label=0 or defect_type='good')
-                if sample['label'] == 0 or sample['defect_type'] == 'good':
-                    sam_masks.append(None)
-                    continue
-                
+                # Setup Image
                 img_tensor = sample['image']
-                
-                # Convert to numpy for SAM
                 mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
                 std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
                 img_denorm = img_tensor * std + mean
                 img_np = (img_denorm.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
                 
-                # Generate SAM mask using the pre-computed bbox and heatmap
-                sam_mask = sam_integrator.predict_mask_from_bbox(img_np, bboxes[i], anomaly_heatmaps[i])
-                sam_masks.append(sam_mask)
+                # --- NEW STEP: SUPPRESS BACKGROUND & NORMALIZE ---
+                try:
+                    h, w = img_np.shape[:2]
+                    sam_integrator.predictor.set_image(img_np)
+                    
+                    # 1. Find the Main Object (Screw)
+                    masks_obj, scores_obj, _ = sam_integrator.predictor.predict(
+                        point_coords=np.array([[w//2, h//2]]),
+                        point_labels=np.array([1]),
+                        multimask_output=True
+                    )
+                    object_mask = masks_obj[np.argmax(scores_obj)]
+                    
+                    # 2. Mask the Heatmap (Remove Background)
+                    masked_heatmap = anomaly_heatmaps[i] * object_mask
+                    
+                    # 3. CRITICAL FIX: Intra-Object Normalization
+                    # This makes the defect the only "hot" thing left
+                    final_heatmap = normalize_heatmap_inside_mask(masked_heatmap, object_mask)
+                    
+                    # Update list for visualization
+                    anomaly_heatmaps[i] = final_heatmap
+                    
+                except Exception as e:
+                    print(f"Background suppression failed: {e}")
+                    final_heatmap = anomaly_heatmaps[i]
+
+                # --- ANOMALY SEGMENTATION ---
+                if sample['label'] == 0 or sample['defect_type'] == 'good':
+                    sam_masks.append(None)
+                else:
+                    # Pass the NORMALIZED heatmap to your point-prompt function
+                    # We increase top_k slightly because the map is now very sharp
+                    sam_mask = sam_integrator.predict_mask_from_heatmap(
+                        img_np, 
+                        final_heatmap, 
+                        top_k_points=10 
+                    )
+                    sam_masks.append(sam_mask)
                 
             num_sam_masks = sum(1 for m in sam_masks if m is not None)
             print(f"Generated {num_sam_masks} SAM masks for anomalous samples")
-        else:
-            print("SAM not available - heatmaps generated with bounding boxes")
+        # # Generate heatmaps and bounding boxes for all images
+        # for i in range(len(anomaly_scores)):
+        #     heatmap = create_anomaly_heatmap(patch_level_scores[i], image_size=image_size)
+        #     anomaly_heatmaps.append(heatmap)
+            
+        #     # Get bounding box from anomaly heatmap
+        #     bbox = sam_integrator.get_bbox_from_anomaly_map(heatmap)
+        #     bboxes.append(bbox)
+        
+        # # Apply SAM post-processing if available
+        # if sam_integrator.sam_available:
+        #     print("Applying SAM post-processing (anomalous samples only)...")
+            
+        #     for i in range(len(anomaly_scores)):
+        #         # Get test image
+        #         sample = test_dataset[i]
+                
+        #         # Only apply SAM to anomalous samples (label=1)
+        #         # Skip normal samples (label=0 or defect_type='good')
+        #         if sample['label'] == 0 or sample['defect_type'] == 'good':
+        #             sam_masks.append(None)
+        #             continue
+                
+        #         img_tensor = sample['image']
+                
+        #         # Convert to numpy for SAM
+        #         mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+        #         std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+        #         img_denorm = img_tensor * std + mean
+        #         img_np = (img_denorm.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+                
+        #         # Generate SAM mask using the pre-computed bbox and heatmap
+        #         sam_mask = sam_integrator.predict_mask_from_bbox(img_np, bboxes[i], anomaly_heatmaps[i])
+        #         sam_masks.append(sam_mask)
+                
+        #     num_sam_masks = sum(1 for m in sam_masks if m is not None)
+        #     print(f"Generated {num_sam_masks} SAM masks for anomalous samples")
+        # else:
+        #     print("SAM not available - heatmaps generated with bounding boxes")
     elif not save_visualizations:
         print("Skipping heatmap generation (--save-visualizations not enabled)")
     
@@ -1412,8 +1616,8 @@ def main():
     parser.add_argument(
         "--root-dir",
         type=str,
-        default=str(Path(__file__).parent.parent / "mvtec_ad"),
-        help="Root directory of MVTec AD dataset"
+        default=None,
+        help="Root directory of MVTec AD dataset (auto-detects if not specified)"
     )
     parser.add_argument(
         "--model-name",
@@ -1501,6 +1705,28 @@ def main():
     )
 
     args = parser.parse_args()
+    
+    # Auto-detect dataset location if not specified
+    if args.root_dir is None:
+        script_dir = Path(__file__).parent
+        possible_paths = [
+            script_dir.parent.parent / "mvtec_ad",  # Project root: /AnomalyDetection/mvtec_ad
+            script_dir.parent / "mvtec_ad",         # Scripts folder: /scripts/mvtec_ad
+            script_dir / "mvtec_ad",                # Same folder as script
+        ]
+        
+        for path in possible_paths:
+            if path.exists():
+                args.root_dir = str(path)
+                print(f"Auto-detected dataset at: {path}")
+                break
+        
+        if args.root_dir is None:
+            print("Error: MVTec dataset not found. Please specify --root-dir")
+            print("Checked locations:")
+            for path in possible_paths:
+                print(f"  {path}")
+            return
 
     # Parse shots array if provided
     shots_to_test = None
@@ -1522,8 +1748,19 @@ def main():
         # Auto-detect SAM checkpoint if not provided
         if args.sam_checkpoint is None:
             script_dir = Path(__file__).parent
-            # Check for SAM checkpoints in order of preference (largest/best first)
+            project_root = script_dir.parent.parent  # Go up to AnomalyDetection root
+            
+            # Check for SAM checkpoints in multiple locations
             sam_checkpoints = [
+                # Check in scripts/SAM/ directory first
+                script_dir.parent / "SAM" / "sam_vit_h_4b8939.pth",
+                script_dir.parent / "SAM" / "sam_vit_l_0b3195.pth", 
+                script_dir.parent / "SAM" / "sam_vit_b_01ec64.pth",
+                # Check in project root sam_models directory
+                project_root / "sam_models" / "sam_vit_h_4b8939.pth",
+                project_root / "sam_models" / "sam_vit_l_0b3195.pth",
+                project_root / "sam_models" / "sam_vit_b_01ec64.pth",
+                # Check in script directory (original location)
                 script_dir / "sam_vit_h_4b8939.pth",
                 script_dir / "sam_vit_l_0b3195.pth",
                 script_dir / "sam_vit_b_01ec64.pth",
