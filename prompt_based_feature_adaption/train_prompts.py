@@ -357,6 +357,11 @@ def main():
                        help="Use CLS token instead of patch embeddings")
     parser.add_argument("--use-adapters", action="store_true",
                        help="Use adapter layers in addition to prompts")
+    parser.add_argument("--modulation-type", type=str, default="per_patch",
+                       choices=['per_patch', 'global', 'learned_transform'],
+                       help="Type of prompt modulation")
+    parser.add_argument("--scaling-factor", type=float, default=0.1,
+                       help="Scaling factor for prompt influence")
     parser.add_argument("--output-dir", type=str, default="prompt_based_feature_adaption/checkpoints",
                        help="Output directory for checkpoints")
 
@@ -374,6 +379,8 @@ def main():
         num_prompts=args.num_prompts,
         device=device,
         use_adapters=args.use_adapters,
+        modulation_type=args.modulation_type,
+        scaling_factor=args.scaling_factor,
     )
 
     # Setup datasets
@@ -435,14 +442,21 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     checkpoint_path = output_dir / f"{args.category}_prompts.pt"
-    torch.save({
+    checkpoint_data = {
         'model_name': args.model_name,
         'category': args.category,
         'num_prompts': args.num_prompts,
         'prompts': model.prompts.data,
+        'prompt_scales': model.prompt_scales.data,
+        'modulation_type': args.modulation_type,
+        'scaling_factor': args.scaling_factor,
         'history': history,
         'args': vars(args),
-    }, checkpoint_path)
+    }
+    # Save MLP weights if using learned_transform
+    if args.modulation_type == 'learned_transform':
+        checkpoint_data['transform_mlp_state'] = model.transform_mlp.state_dict()
+    torch.save(checkpoint_data, checkpoint_path)
 
     print(f"\n✓ Checkpoint saved to {checkpoint_path}")
 
