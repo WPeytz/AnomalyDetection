@@ -123,15 +123,29 @@ def load_checkpoint(checkpoint_path: Path, device: str = 'cuda'):
     """Load trained prompts from checkpoint."""
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
+    # Get modulation settings (with backwards compatibility)
+    modulation_type = checkpoint.get('modulation_type', 'global')
+    scaling_factor = checkpoint.get('scaling_factor', 0.5)
+
     # Load model with same configuration
     model = load_dinov3_for_prompting(
         model_name=checkpoint['model_name'],
         num_prompts=checkpoint['num_prompts'],
         device=device,
+        modulation_type=modulation_type,
+        scaling_factor=scaling_factor,
     )
 
     # Load trained prompts
     model.prompts.data = checkpoint['prompts'].to(device)
+
+    # Load prompt scales if available
+    if 'prompt_scales' in checkpoint:
+        model.prompt_scales.data = checkpoint['prompt_scales'].to(device)
+
+    # Load MLP weights if using learned_transform
+    if modulation_type == 'learned_transform' and 'transform_mlp_state' in checkpoint:
+        model.transform_mlp.load_state_dict(checkpoint['transform_mlp_state'])
 
     return model, checkpoint
 

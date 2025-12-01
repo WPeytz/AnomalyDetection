@@ -24,6 +24,8 @@ class VisualPromptTuning(nn.Module):
         embed_dim: Embedding dimension of the model
         prompt_dropout: Dropout rate for prompts
         initialize_from_embeddings: If True, initialize prompts from random patches
+        modulation_type: Type of modulation ('per_patch', 'global', 'learned_transform')
+        scaling_factor: Scaling factor for prompt influence
     """
 
     def __init__(
@@ -33,6 +35,8 @@ class VisualPromptTuning(nn.Module):
         embed_dim: int = 384,
         prompt_dropout: float = 0.0,
         initialize_from_embeddings: bool = False,
+        modulation_type: str = 'per_patch',
+        scaling_factor: float = 0.1,
     ):
         super().__init__()
 
@@ -43,6 +47,8 @@ class VisualPromptTuning(nn.Module):
 
         self.num_prompts = num_prompts
         self.embed_dim = embed_dim
+        self.modulation_type = modulation_type
+        self.scaling_factor = scaling_factor
 
         # Initialize learnable prompts
         if initialize_from_embeddings:
@@ -55,6 +61,22 @@ class VisualPromptTuning(nn.Module):
 
         # Optional dropout for prompts
         self.prompt_dropout = nn.Dropout(prompt_dropout) if prompt_dropout > 0 else None
+
+        # Learnable scaling per prompt (for adaptive weighting)
+        self.prompt_scales = nn.Parameter(torch.ones(num_prompts) * 0.1)
+
+        # For 'learned_transform' modulation: small MLP to transform prompt influence
+        if modulation_type == 'learned_transform':
+            self.transform_mlp = nn.Sequential(
+                nn.Linear(embed_dim * 2, embed_dim),
+                nn.GELU(),
+                nn.Linear(embed_dim, embed_dim),
+            )
+            # Initialize with small weights for stability
+            for layer in self.transform_mlp:
+                if isinstance(layer, nn.Linear):
+                    nn.init.xavier_uniform_(layer.weight, gain=0.1)
+                    nn.init.zeros_(layer.bias)
 
         # Track if model is in training mode
         self.dinov3.eval()
@@ -82,12 +104,14 @@ class VisualPromptTuning(nn.Module):
         with torch.no_grad():
             # Use forward_features() or default forward to get embeddings
             # HuggingFace models return a BaseModelOutputWithPooling object
-            if hasattr(self.dinov3, 'forward'):
-                output = self.dinov3(images)
-            elif hasattr(self.dinov3, 'forward_features'):
+            if hasattr(self.dinov3, 'forward_features'):
+                # Torch.hub format
                 output = self.dinov3.forward_features(images)
+            elif hasattr(self.dinov3, 'config'):
+                # HuggingFace model - use pixel_values kwarg
+                output = self.dinov3(pixel_values=images)
             else:
-                output = self.dinov3(images, is_training=False)
+                output = self.dinov3(images)
 
         result = {}
         cls_embed = None
@@ -109,6 +133,13 @@ class VisualPromptTuning(nn.Module):
                     cls_embed = last_hidden[:, 0]  # CLS token
                 if return_patches:
                     patch_embed = last_hidden[:, 1:]  # Patch tokens
+        elif hasattr(output, 'last_hidden_state'):
+            # HuggingFace BaseModelOutputWithPooling object
+            last_hidden = output.last_hidden_state
+            if return_cls:
+                cls_embed = last_hidden[:, 0]  # CLS token
+            if return_patches:
+                patch_embed = last_hidden[:, 1:]  # Patch tokens
         elif isinstance(output, torch.Tensor):
             # Fallback for tensor output
             if return_cls:
@@ -121,39 +152,106 @@ class VisualPromptTuning(nn.Module):
         batch_size = images.shape[0]
         prompt_expand = self.prompts.unsqueeze(0).expand(batch_size, -1, -1)  # [B, P, D]
 
+        # Apply learnable per-prompt scaling
+        scaled_prompts = prompt_expand * self.prompt_scales.view(1, -1, 1)  # [B, P, D]
+
         if return_patches and patch_embed is not None:
-            # Compute attention between prompts and patches
-            # This creates a connection between prompts and patch embeddings
-            prompt_norm = prompt_expand / (prompt_expand.norm(dim=-1, keepdim=True) + 1e-8)
-            patch_norm = patch_embed / (patch_embed.norm(dim=-1, keepdim=True) + 1e-8)
-
-            prompt_sim = torch.bmm(prompt_norm, patch_norm.transpose(1, 2))  # [B, P, N_patches]
-
-            # Use prompts to modulate patch embeddings (residual connection)
-            prompt_influence = torch.bmm(prompt_sim.softmax(dim=-1), patch_embed)  # [B, P, D]
-            prompt_effect = prompt_influence.mean(dim=1, keepdim=True)  # [B, 1, D]
-
-            # Add prompt effect as residual (scaled very small to preserve pretrained features)
-            # Using 0.01 instead of 0.1 to minimize disruption to pretrained features
-            patch_embed = patch_embed + 0.01 * prompt_effect
-
+            patch_embed = self._modulate_patches(patch_embed, scaled_prompts)
             result['patch_embeddings'] = patch_embed
 
         if return_cls and cls_embed is not None:
-            # Similar modulation for CLS token
-            cls_expand = cls_embed.unsqueeze(1)  # [B, 1, D]
-
-            prompt_norm = prompt_expand / (prompt_expand.norm(dim=-1, keepdim=True) + 1e-8)
-            cls_norm = cls_expand / (cls_expand.norm(dim=-1, keepdim=True) + 1e-8)
-
-            cls_sim = torch.bmm(prompt_norm, cls_norm.transpose(1, 2))  # [B, P, 1]
-
-            prompt_influence = torch.bmm(cls_sim.softmax(dim=1).transpose(1, 2), prompt_expand)  # [B, 1, D]
-            cls_embed = cls_embed + 0.01 * prompt_influence.squeeze(1)
-
+            cls_embed = self._modulate_cls(cls_embed, scaled_prompts)
             result['cls_embeddings'] = cls_embed
 
         return result
+
+    def _modulate_patches(self, patch_embed: torch.Tensor, scaled_prompts: torch.Tensor) -> torch.Tensor:
+        """
+        Apply prompt modulation to patch embeddings.
+
+        Args:
+            patch_embed: Patch embeddings [B, N, D]
+            scaled_prompts: Scaled prompt embeddings [B, P, D]
+
+        Returns:
+            Modulated patch embeddings [B, N, D]
+        """
+        # Normalize for attention computation
+        prompt_norm = scaled_prompts / (scaled_prompts.norm(dim=-1, keepdim=True) + 1e-8)
+        patch_norm = patch_embed / (patch_embed.norm(dim=-1, keepdim=True) + 1e-8)
+
+        if self.modulation_type == 'per_patch':
+            # PER-PATCH MODULATION: Each patch gets a different prompt-weighted effect
+            # Compute attention: patches attend to prompts
+            # [B, N, D] @ [B, D, P] -> [B, N, P]
+            attn_weights = torch.bmm(patch_norm, prompt_norm.transpose(1, 2))
+            attn_weights = attn_weights.softmax(dim=-1)  # [B, N, P]
+
+            # Each patch gets a weighted combination of prompts
+            # [B, N, P] @ [B, P, D] -> [B, N, D]
+            prompt_effect = torch.bmm(attn_weights, scaled_prompts)
+
+            # Residual connection with scaling
+            patch_embed = patch_embed + self.scaling_factor * prompt_effect
+
+        elif self.modulation_type == 'learned_transform':
+            # LEARNED TRANSFORM: MLP combines patch and prompt information
+            # Compute attention weights
+            attn_weights = torch.bmm(patch_norm, prompt_norm.transpose(1, 2))
+            attn_weights = attn_weights.softmax(dim=-1)  # [B, N, P]
+
+            # Get prompt influence per patch
+            prompt_effect = torch.bmm(attn_weights, scaled_prompts)  # [B, N, D]
+
+            # Concatenate patch embedding with prompt effect and transform
+            B, N, D = patch_embed.shape
+            combined = torch.cat([patch_embed, prompt_effect], dim=-1)  # [B, N, 2D]
+            combined_flat = combined.view(B * N, -1)
+            transformed = self.transform_mlp(combined_flat).view(B, N, D)
+
+            # Residual connection
+            patch_embed = patch_embed + self.scaling_factor * transformed
+
+        else:  # 'global' - original behavior
+            # GLOBAL MODULATION: Same effect for all patches (original broken approach)
+            prompt_sim = torch.bmm(prompt_norm, patch_norm.transpose(1, 2))  # [B, P, N]
+            prompt_influence = torch.bmm(prompt_sim.softmax(dim=-1), patch_embed)  # [B, P, D]
+            prompt_effect = prompt_influence.mean(dim=1, keepdim=True)  # [B, 1, D]
+            patch_embed = patch_embed + self.scaling_factor * prompt_effect
+
+        return patch_embed
+
+    def _modulate_cls(self, cls_embed: torch.Tensor, scaled_prompts: torch.Tensor) -> torch.Tensor:
+        """
+        Apply prompt modulation to CLS token.
+
+        Args:
+            cls_embed: CLS embeddings [B, D]
+            scaled_prompts: Scaled prompt embeddings [B, P, D]
+
+        Returns:
+            Modulated CLS embeddings [B, D]
+        """
+        cls_expand = cls_embed.unsqueeze(1)  # [B, 1, D]
+
+        prompt_norm = scaled_prompts / (scaled_prompts.norm(dim=-1, keepdim=True) + 1e-8)
+        cls_norm = cls_expand / (cls_expand.norm(dim=-1, keepdim=True) + 1e-8)
+
+        # CLS attends to prompts: [B, 1, D] @ [B, D, P] -> [B, 1, P]
+        attn_weights = torch.bmm(cls_norm, prompt_norm.transpose(1, 2))
+        attn_weights = attn_weights.softmax(dim=-1)  # [B, 1, P]
+
+        # Weighted combination of prompts
+        prompt_effect = torch.bmm(attn_weights, scaled_prompts).squeeze(1)  # [B, D]
+
+        if self.modulation_type == 'learned_transform':
+            combined = torch.cat([cls_embed, prompt_effect], dim=-1)  # [B, 2D]
+            transformed = self.transform_mlp(combined)  # [B, D]
+            cls_embed = cls_embed + self.scaling_factor * transformed
+        else:
+            cls_embed = cls_embed + self.scaling_factor * prompt_effect
+
+        return cls_embed
 
     def forward_with_prompts(
         self,
@@ -338,6 +436,8 @@ def load_dinov3_for_prompting(
     num_prompts: int = 10,
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
     use_adapters: bool = False,
+    modulation_type: str = 'per_patch',
+    scaling_factor: float = 0.1,
 ) -> VisualPromptTuning:
     """
     Convenience function to load DINOv3 with prompt tuning.
@@ -347,6 +447,8 @@ def load_dinov3_for_prompting(
         num_prompts: Number of prompt tokens
         device: Device to load model on
         use_adapters: Whether to use adapter layers in addition to prompts
+        modulation_type: Type of modulation ('per_patch', 'global', 'learned_transform')
+        scaling_factor: Scaling factor for prompt influence
 
     Returns:
         VisualPromptTuning or PromptTuningWithAdapter model
@@ -398,7 +500,12 @@ def load_dinov3_for_prompting(
             dinov3,
             num_prompts=num_prompts,
             embed_dim=embed_dim,
+            modulation_type=modulation_type,
+            scaling_factor=scaling_factor,
         )
+
+    print(f"  Modulation type: {modulation_type}")
+    print(f"  Scaling factor: {scaling_factor}")
 
     num_trainable = model.get_num_trainable_params()
     num_frozen = model.get_num_frozen_params()
