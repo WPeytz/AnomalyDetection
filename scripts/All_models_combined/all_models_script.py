@@ -134,20 +134,106 @@ def compute_patch_anomaly_scores_zeroshot(
     # Convert to numpy
     patch_anomaly_scores = patch_anomaly_scores.cpu().numpy()
     
-    # Normalize scores per image to [0, 1] range for better contrast
-    # This makes each image's anomalies more visible
-    for img_idx in range(N):
-        img_scores = patch_anomaly_scores[img_idx]
-        min_score = img_scores.min()
-        max_score = img_scores.max()
-        if max_score > min_score + 1e-8:  # Avoid division by zero
-            patch_anomaly_scores[img_idx] = (img_scores - min_score) / (max_score - min_score)
-        else:
-            # If all scores are the same, set to 0 (no anomaly)
-            patch_anomaly_scores[img_idx] = 0.0
-
+    # DO NOT normalize per image - this amplifies background noise
+    # Keep absolute anomaly scores to preserve true anomaly magnitude
+    # Normalization should happen at visualization time, not here
     
     return patch_anomaly_scores
+
+
+def compute_patch_anomaly_scores_mirroring(
+    test_embeddings: np.ndarray,      # (N, P, D)
+    original_images: torch.Tensor,    # (N, C, H, W)
+    extractor,                        # DINOv3EmbeddingExtractor
+    image_size: int = 224,
+    patch_size: int = 14
+) -> np.ndarray:
+    """
+    Compute patch-level anomaly scores using Global Mirroring strategy.
+    Compares Original(x) vs Flipped(x) directly.
+    """
+    N, P, D = test_embeddings.shape
+    
+    # 1. Dynamic Grid Size Detection
+    grid_size = int(np.sqrt(P))
+    n_registers = 0
+    for r in [0, 4, 1, 5, 8]:
+        spatial = P - r
+        side = int(np.sqrt(spatial))
+        if side * side == spatial:
+            grid_size = side
+            n_registers = r
+            break
+    expected_spatial = grid_size * grid_size
+    
+    # 2. Flip the original images horizontally
+    flipped_images = torch.flip(original_images, dims=[3])
+    
+    # 3. Extract features from the flipped images
+    device = next(extractor.model.parameters()).device
+    with torch.no_grad():
+        flipped_images = flipped_images.to(device)
+        flipped_outputs = extractor.model(flipped_images)
+        flipped_embeddings = flipped_outputs.last_hidden_state.cpu()
+    
+    # 4. Prepare Embeddings
+    # CRITICAL CHANGE: We do NOT un-flip spatially. 
+    # We want to compare Left(Original) vs Left(Flipped).
+    
+    if n_registers > 0:
+        spatial_embeddings = flipped_embeddings[:, n_registers:, :]
+    else:
+        spatial_embeddings = flipped_embeddings
+        
+    # Reshape to grid (N, H, W, D)
+    ref_grid = spatial_embeddings.reshape(N, grid_size, grid_size, D)
+    
+    # Prepare Original Embeddings
+    orig_tensor = torch.from_numpy(test_embeddings).float()
+    if n_registers > 0:
+        orig_spatial = orig_tensor[:, n_registers:, :]
+    else:
+        orig_spatial = orig_tensor
+    orig_grid = orig_spatial.reshape(N, grid_size, grid_size, D)
+
+    # Normalize
+    orig_norm = torch.nn.functional.normalize(orig_grid, dim=-1)
+    ref_norm = torch.nn.functional.normalize(ref_grid, dim=-1)
+    
+    # 5. Local Neighborhood Search (Jittering)
+    # Allows for small misalignment between left and right sides
+    
+    # Permute to (N, D, H, W) for padding
+    ref_perm = ref_norm.permute(0, 3, 1, 2)
+    
+    # Pad reference feature map by 1 pixel
+    pad = 1
+    ref_padded = torch.nn.functional.pad(ref_perm, (pad, pad, pad, pad), mode='replicate')
+    ref_padded = ref_padded.permute(0, 2, 3, 1) # (N, H+2, W+2, D)
+    
+    # Compute max cosine similarity
+    max_sim_map = torch.zeros((N, grid_size, grid_size)) - 1.0
+    
+    for dy in [-1, 0, 1]:
+        for dx in [-1, 0, 1]:
+            # Extract shifted window
+            ref_shifted = ref_padded[:, 1+dy : 1+dy+grid_size, 1+dx : 1+dx+grid_size, :]
+            
+            # Compute similarity
+            sim = (orig_norm * ref_shifted).sum(dim=-1)
+            max_sim_map = torch.maximum(max_sim_map, sim)
+            
+    # Flatten back
+    max_sim_flat = max_sim_map.reshape(N, expected_spatial)
+    
+    if n_registers > 0:
+        reg_scores = torch.zeros((N, n_registers))
+        spatial_scores = 1 - max_sim_flat
+        anomaly_scores = torch.cat([reg_scores, spatial_scores], dim=1)
+    else:
+        anomaly_scores = 1 - max_sim_flat
+        
+    return anomaly_scores.numpy()
 
 
 def compute_patch_anomaly_scores(
@@ -479,79 +565,10 @@ class MirroringAnomalyDetector:
         self.extractor = extractor
         self.image_size = image_size
         self.patch_size = patch_size
-        # Grid size: For patch_size=14 on 224x224 image, we get 224/14=16 patches per side
-        # BUT the actual spatial grid is 14x14=196 patches (not 16x16=256)
-        # This is because DINOv3 uses overlapping patches or different stride
         self.grid_h = 14  # Actual spatial grid size for DINOv3
         self.grid_w = 14
         self.baseline_mean = 0
         self.baseline_std = 1
-
-    def _align_flipped_patches(self, flipped_embeddings):
-        """
-        Re-aligns embeddings from a flipped image to match the original spatial grid.
-        Input: (N, P, D)
-        """
-        N, P, D = flipped_embeddings.shape
-        expected_patches = self.grid_h * self.grid_w  # 14*14 = 196 for DINOv3
-        
-        # Detect and handle register tokens (usually 4 in DINOv3)
-        n_registers = 0
-        if P > expected_patches:
-            n_registers = P - expected_patches
-            
-        # Separate registers and spatial tokens
-        registers = flipped_embeddings[:, :n_registers, :]
-        spatial = flipped_embeddings[:, n_registers:, :]
-        
-        # Check if spatial patches match expected grid
-        current_P = spatial.shape[1]
-        
-        if current_P == expected_patches:
-            # Perfect match: 196 spatial patches for 14x14 grid
-            h, w = self.grid_h, self.grid_w
-            
-            try:
-                spatial_grid = spatial.reshape(N, h, w, D)
-                
-                # Flip back horizontally (axis 2 is Width)
-                spatial_grid_flipped = torch.flip(torch.tensor(spatial_grid), dims=[2]).numpy()
-                
-                # Flatten back
-                spatial_restored = spatial_grid_flipped.reshape(N, current_P, D)
-                
-                # Recombine with registers
-                if n_registers > 0:
-                    return np.concatenate([registers, spatial_restored], axis=1)
-                return spatial_restored
-                
-            except Exception as e:
-                print(f"Warning: Patch reshaping failed: {e}")
-                print(f"Using fallback: returning original embeddings")
-                return flipped_embeddings
-        else:
-            # Mismatch: try to auto-detect grid or use fallback
-            print(f"Warning: Spatial patch count mismatch.")
-            print(f"Expected: {expected_patches} ({self.grid_h}x{self.grid_w}), Got: {current_P}")
-            
-            # Try to detect if it's a perfect square
-            h = int(np.sqrt(current_P))
-            if h * h == current_P:
-                print(f"Auto-detected {h}x{h} grid for {current_P} patches")
-                try:
-                    spatial_grid = spatial.reshape(N, h, h, D)
-                    spatial_grid_flipped = torch.flip(torch.tensor(spatial_grid), dims=[2]).numpy()
-                    spatial_restored = spatial_grid_flipped.reshape(N, current_P, D)
-                    
-                    if n_registers > 0:
-                        return np.concatenate([registers, spatial_restored], axis=1)
-                    return spatial_restored
-                    
-                except Exception as e:
-                    print(f"Auto-detection failed: {e}")
-                    
-            print("Using fallback: returning original embeddings")
-            return flipped_embeddings
 
     def fit(self, train_loader):
         """
@@ -559,41 +576,32 @@ class MirroringAnomalyDetector:
         """
         print("Training Mirroring Model (Estimating Normal Symmetry Error)...")
         
-        # 1. Get Original Embeddings
-        orig_results = self.extractor.extract_embeddings_batch(
-            train_loader, extract_patches=True, extract_cls=False
-        )
-        orig_patches = orig_results['patch_embeddings']
+        # Process batch by batch to avoid memory issues
+        all_patch_scores = []
         
-        # 2. Get Flipped Embeddings
-        # Create a flipped version of the dataset/loader
-        train_dataset_flipped = FlippedDataset(train_loader.dataset)
-        flipped_loader = DataLoader(
-            train_dataset_flipped, 
-            batch_size=train_loader.batch_size, 
-            shuffle=False, 
-            collate_fn=train_loader.collate_fn
-        )
+        for batch in train_loader:
+            images = batch['image']  # (batch_size, C, H, W)
+            
+            # Extract embeddings for original images
+            with torch.no_grad():
+                outputs = self.extractor.model(images.to(next(self.extractor.model.parameters()).device))
+                orig_embeddings = outputs.last_hidden_state.cpu().numpy()  # (B, P, D)
+            
+            # Compute patch-level symmetry errors for this batch
+            batch_patch_scores = compute_patch_anomaly_scores_mirroring(
+                orig_embeddings,
+                images,
+                self.extractor,
+                self.image_size,
+                self.patch_size
+            )
+            all_patch_scores.append(batch_patch_scores)
         
-        flip_results = self.extractor.extract_embeddings_batch(
-            flipped_loader, extract_patches=True, extract_cls=False
-        )
-        flip_patches = flip_results['patch_embeddings']
+        # Concatenate all batches
+        patch_anomaly_scores = np.concatenate(all_patch_scores, axis=0)
         
-        # 3. Align Flipped Patches Back
-        flip_patches_aligned = self._align_flipped_patches(flip_patches)
-        
-        # 4. Compute Patch-wise Cosine Distance
-        # Normalize
-        orig_norm = orig_patches / (np.linalg.norm(orig_patches, axis=-1, keepdims=True) + 1e-8)
-        flip_norm = flip_patches_aligned / (np.linalg.norm(flip_patches_aligned, axis=-1, keepdims=True) + 1e-8)
-        
-        # Cosine similarity per patch
-        sim_per_patch = (orig_norm * flip_norm).sum(axis=-1)
-        dist_per_patch = 1 - sim_per_patch
-        
-        # Image-level score: Max patch error (most asymmetric part)
-        image_scores = dist_per_patch.max(axis=1)
+        # Image-level score: Mean of patch errors
+        image_scores = patch_anomaly_scores.mean(axis=1)
         
         self.baseline_mean = np.mean(image_scores)
         self.baseline_std = np.std(image_scores)
@@ -606,39 +614,40 @@ class MirroringAnomalyDetector:
         """
         print("Evaluating with Mirroring Strategy...")
         
-        # 1. Original
-        orig_results = self.extractor.extract_embeddings_batch(
-            test_loader, extract_patches=True, extract_cls=False
-        )
-        orig_patches = orig_results['patch_embeddings']
+        # Process batch by batch
+        all_patch_scores = []
+        all_labels = []
         
-        # 2. Flipped
-        test_dataset_flipped = FlippedDataset(test_loader.dataset)
-        flipped_loader = DataLoader(
-            test_dataset_flipped, 
-            batch_size=test_loader.batch_size, 
-            shuffle=False, 
-            collate_fn=test_loader.collate_fn
-        )
-        flip_results = self.extractor.extract_embeddings_batch(
-            flipped_loader, extract_patches=True, extract_cls=False
-        )
-        flip_patches = flip_results['patch_embeddings']
+        for batch in test_loader:
+            images = batch['image']  # (batch_size, C, H, W)
+            labels = batch['label'].numpy()
+            
+            # Extract embeddings for original images
+            with torch.no_grad():
+                outputs = self.extractor.model(images.to(next(self.extractor.model.parameters()).device))
+                orig_embeddings = outputs.last_hidden_state.cpu().numpy()  # (B, P, D)
+            
+            # Compute patch-level symmetry errors for this batch
+            batch_patch_scores = compute_patch_anomaly_scores_mirroring(
+                orig_embeddings,
+                images,
+                self.extractor,
+                self.image_size,
+                self.patch_size
+            )
+            all_patch_scores.append(batch_patch_scores)
+            all_labels.append(labels)
         
-        # 3. Align
-        flip_patches_aligned = self._align_flipped_patches(flip_patches)
+        # Concatenate all batches
+        patch_anomaly_scores = np.concatenate(all_patch_scores, axis=0)
+        labels_np = np.concatenate(all_labels, axis=0)
         
-        # 4. Compute Scores
-        orig_norm = orig_patches / (np.linalg.norm(orig_patches, axis=-1, keepdims=True) + 1e-8)
-        flip_norm = flip_patches_aligned / (np.linalg.norm(flip_patches_aligned, axis=-1, keepdims=True) + 1e-8)
+        # Image-level score: Mean of patch errors
+        image_scores = patch_anomaly_scores.mean(axis=1)
         
-        sim_per_patch = (orig_norm * flip_norm).sum(axis=-1)
-        dist_per_patch = 1 - sim_per_patch
+        print(f"Using mean of all patch symmetry errors for image-level scoring")
         
-        # Image-level anomaly score
-        raw_scores = dist_per_patch.max(axis=1)
-        
-        return raw_scores, dist_per_patch, orig_results['labels']
+        return image_scores, patch_anomaly_scores, labels_np
 
 
 def create_anomaly_heatmap(patch_scores: np.ndarray, patch_size: int = 16, image_size: int = 224) -> np.ndarray:
@@ -904,16 +913,8 @@ def visualize_sam_enhanced_results(
 
     # Plot anomaly heatmap if available
     if anomaly_heatmap is not None:
-        import matplotlib.patches as patches
-        
         im1 = axes[1].imshow(anomaly_heatmap, cmap='hot', alpha=0.7)
         axes[1].imshow(image_np, alpha=0.3)
-        # Add bounding box to heatmap
-        if bbox is not None:
-            x_min, y_min, x_max, y_max = bbox
-            rect = patches.Rectangle((x_min, y_min), x_max - x_min, y_max - y_min,
-                                    linewidth=2, edgecolor='lime', facecolor='none')
-            axes[1].add_patch(rect)
         axes[1].set_title('Anomaly Heatmap', fontsize=12)
         axes[1].axis('off')
         plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
@@ -934,14 +935,9 @@ def visualize_sam_enhanced_results(
             axes[3].set_title('SAM-Enhanced Result', fontsize=12)
             axes[3].axis('off')
         else:
-            # Plot heatmap with bounding box (no SAM)
+            # Plot heatmap localization (no SAM)
             axes[2].imshow(image_np)
             axes[2].imshow(anomaly_heatmap, alpha=0.7, cmap='hot')
-            if bbox is not None:
-                x_min, y_min, x_max, y_max = bbox
-                rect = patches.Rectangle((x_min, y_min), x_max - x_min, y_max - y_min,
-                                        linewidth=2, edgecolor='lime', facecolor='none')
-                axes[2].add_patch(rect)
             axes[2].set_title('DINOv3 Anomaly Localization', fontsize=12)
             axes[2].axis('off')
 
