@@ -1,0 +1,71 @@
+// DINOv3 Prompt Adaptation Architecture
+digraph {
+	nodesep=0.5 rankdir=TB ranksep=0.6 splines=ortho
+	node [fontname=Helvetica fontsize=11]
+	edge [fontname=Helvetica fontsize=10]
+	subgraph cluster_main {
+		bgcolor="#FAFAFA" color="#424242" fontname="Helvetica-Bold" fontsize=14 label="DINOv3 Prompt Adaptation" labelloc=t style=rounded
+		input [label="Input Image
+(224 × 224 × 3)" color="#1976D2" fillcolor="#E3F2FD" shape=box style="rounded,filled"]
+		dinov3 [label="Frozen DINOv3
+(ViT-S/16)" color="#F9A825" fillcolor="#FFF9C4" shape=box style="rounded,filled"]
+		patches [label="Patch Embeddings
+[B, 196, 384]" color="#388E3C" fillcolor="#C8E6C9" shape=box style="rounded,filled"]
+		prompts [label="Learnable Prompts
+[10, 384]
+(× prompt_scales)" color="#FF8F00" fillcolor="#FFECB3" penwidth=2 shape=box style="rounded,filled"]
+		normalize [label="L2 Normalize
+(patches & prompts)" color="#3F51B5" fillcolor="#E8EAF6" shape=box style="rounded,filled"]
+		attention [label="Attention Weights
+softmax(patches @ prompts.T)
+[B, 196, 10]" color="#3F51B5" fillcolor="#E8EAF6" shape=box style="rounded,filled"]
+		weighted_sum [label="Weighted Sum
+attn @ prompts
+[B, 196, 384]" color="#3F51B5" fillcolor="#E8EAF6" shape=box style="rounded,filled"]
+		scale [label="Scale (α=0.1)" color="#3F51B5" fillcolor="#E8EAF6" shape=box style="rounded,filled"]
+		add [label="+" color="#424242" fillcolor=white fixedsize=true shape=circle style=filled width=0.4]
+		adapted [label="Adapted Embeddings
+[B, 196, 384]" color="#388E3C" fillcolor="#C8E6C9" shape=box style="rounded,filled"]
+		input -> dinov3
+		dinov3 -> patches
+		patches -> normalize
+		prompts -> normalize
+		normalize -> attention
+		attention -> weighted_sum
+		prompts -> weighted_sum [color="#FF8F00" style=dashed]
+		weighted_sum -> scale
+		scale -> add
+		patches -> add [label=residual color="#388E3C" style=dashed]
+		add -> adapted
+	}
+	subgraph cluster_training {
+		bgcolor="#FFF8E1" color="#D32F2F" fontname="Helvetica-Bold" fontsize=12 label="Training (Few-Shot)" labelloc=t style="rounded,dashed"
+		normal_emb [label="Normal
+Embeddings" color="#388E3C" fillcolor="#C8E6C9" shape=box style="rounded,filled"]
+		defect_emb [label="Defect
+Embeddings" color="#388E3C" fillcolor="#C8E6C9" shape=box style="rounded,filled"]
+		sep_loss [label="Separability
+Loss" color="#D32F2F" fillcolor="#FFCDD2" shape=diamond style=filled]
+		normal_emb -> sep_loss
+		defect_emb -> sep_loss
+	}
+	subgraph cluster_inference {
+		bgcolor="#ECEFF1" color="#616161" fontname="Helvetica-Bold" fontsize=12 label="Inference & Segmentation" labelloc=t style=rounded
+		memory [label="Memory Bank
+(Normal Embeddings)" color="#616161" fillcolor="#F5F5F5" shape=box style="rounded,filled"]
+		knn [label="k-NN Distance
+Scoring" color="#616161" fillcolor="#E0E0E0" shape=diamond style=filled]
+		heatmap [label="Anomaly Map
+(Heatmap)" color="#E64A19" fillcolor="#FFCCBC" shape=box style="rounded,filled"]
+		sam [label="SAM
+(Segmentation)" color="#E64A19" fillcolor="#FFCCBC" shape=box style="rounded,filled"]
+		memory -> knn [label=reference]
+		knn -> heatmap
+		heatmap -> sam
+	}
+	adapted -> normal_emb [color="#388E3C" style=dashed]
+	adapted -> defect_emb [color="#388E3C" style=dashed]
+	sep_loss -> prompts [label="update
+(backprop)" color="#D32F2F" constraint=false style=dashed]
+	adapted -> knn [label="test embeds" color="#424242"]
+}

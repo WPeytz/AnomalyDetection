@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from sklearn.metrics import roc_auc_score, average_precision_score
+from sklearn.metrics import roc_auc_score, average_precision_score, precision_recall_curve
 
 # Add parent directory to path
 sys.path.append(str(Path(__file__).parent.parent / 'scripts'))
@@ -108,14 +108,71 @@ def compute_anomaly_scores(test_embed, normal_embed, k=1):
     return anomaly_scores
 
 
+def find_optimal_threshold(scores, labels):
+    """
+    Find the threshold that maximizes F1 score.
+
+    Args:
+        scores: Anomaly scores
+        labels: Ground truth labels (0=normal, 1=anomaly)
+
+    Returns:
+        Optimal threshold value
+    """
+    precision, recall, thresholds = precision_recall_curve(labels, scores)
+    # Compute F1 scores (avoid division by zero)
+    f1_scores = 2 * (precision * recall) / (precision + recall + 1e-8)
+    best_idx = np.argmax(f1_scores)
+    # thresholds array is one element shorter than precision/recall
+    return thresholds[min(best_idx, len(thresholds) - 1)]
+
+
+def compute_confusion_matrix(scores, labels, threshold):
+    """
+    Compute confusion matrix at a given threshold.
+
+    Args:
+        scores: Anomaly scores
+        labels: Ground truth labels (0=normal, 1=anomaly)
+        threshold: Decision threshold
+
+    Returns:
+        Dictionary with TP, FP, TN, FN counts
+    """
+    predictions = (scores >= threshold).astype(int)
+    tp = int(np.sum((predictions == 1) & (labels == 1)))
+    fp = int(np.sum((predictions == 1) & (labels == 0)))
+    tn = int(np.sum((predictions == 0) & (labels == 0)))
+    fn = int(np.sum((predictions == 0) & (labels == 1)))
+
+    return {'TP': tp, 'FP': fp, 'TN': tn, 'FN': fn}
+
+
 def evaluate(anomaly_scores, labels):
     """Evaluate anomaly detection performance."""
     auroc = roc_auc_score(labels, anomaly_scores)
     ap = average_precision_score(labels, anomaly_scores)
 
+    # Find optimal threshold and compute confusion matrix
+    threshold = find_optimal_threshold(anomaly_scores, labels)
+    confusion = compute_confusion_matrix(anomaly_scores, labels, threshold)
+
+    # Compute derived metrics from confusion matrix
+    tp, fp, tn, fn = confusion['TP'], confusion['FP'], confusion['TN'], confusion['FN']
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+    accuracy = (tp + tn) / (tp + fp + tn + fn) if (tp + fp + tn + fn) > 0 else 0.0
+
     return {
         'auroc': float(auroc),
         'average_precision': float(ap),
+        'threshold': float(threshold),
+        'confusion_matrix': confusion,
+        'precision': float(precision),
+        'recall': float(recall),
+        'f1': float(f1),
+        'accuracy': float(accuracy),
     }
 
 
@@ -281,6 +338,10 @@ def compare_with_baseline(
     print("\nPrompt-Tuned Results:")
     print(f"  AUROC: {metrics_prompt['auroc']:.4f}")
     print(f"  Average Precision: {metrics_prompt['average_precision']:.4f}")
+    print(f"  Threshold: {metrics_prompt['threshold']:.4f}")
+    cm = metrics_prompt['confusion_matrix']
+    print(f"  Confusion Matrix: TP={cm['TP']}, FP={cm['FP']}, TN={cm['TN']}, FN={cm['FN']}")
+    print(f"  Precision: {metrics_prompt['precision']:.4f}, Recall: {metrics_prompt['recall']:.4f}, F1: {metrics_prompt['f1']:.4f}")
 
     # Evaluate zero-shot baseline
     print("\n" + "=" * 70)
@@ -299,6 +360,10 @@ def compare_with_baseline(
     print("\nZero-Shot Results:")
     print(f"  AUROC: {metrics_baseline['auroc']:.4f}")
     print(f"  Average Precision: {metrics_baseline['average_precision']:.4f}")
+    print(f"  Threshold: {metrics_baseline['threshold']:.4f}")
+    cm_baseline = metrics_baseline['confusion_matrix']
+    print(f"  Confusion Matrix: TP={cm_baseline['TP']}, FP={cm_baseline['FP']}, TN={cm_baseline['TN']}, FN={cm_baseline['FN']}")
+    print(f"  Precision: {metrics_baseline['precision']:.4f}, Recall: {metrics_baseline['recall']:.4f}, F1: {metrics_baseline['f1']:.4f}")
 
     # Comparison
     print("\n" + "=" * 70)

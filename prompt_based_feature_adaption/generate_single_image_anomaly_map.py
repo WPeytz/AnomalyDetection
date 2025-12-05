@@ -204,9 +204,16 @@ def visualize_anomaly_map(
     axes[1].axis('off')
     plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
 
-    # Overlay
+    # Overlay - use alpha based on anomaly intensity so low scores are transparent
     axes[2].imshow(original_np)
-    axes[2].imshow(heatmap_norm, cmap='hot', alpha=0.6)
+    # Create RGBA overlay where alpha scales with anomaly score
+    cmap = plt.cm.hot
+    heatmap_rgba = cmap(heatmap_norm)
+    # Use percentile threshold: only show top 25% of anomaly scores (75th percentile)
+    threshold = np.percentile(heatmap_norm, 75)
+    alpha_mask = np.clip((heatmap_norm - threshold) / (1 - threshold + 1e-8), 0, 1)
+    heatmap_rgba[..., 3] = alpha_mask * 0.7  # Max alpha of 0.7
+    axes[2].imshow(heatmap_rgba)
     axes[2].set_title('Overlay', fontsize=12)
     axes[2].axis('off')
 
